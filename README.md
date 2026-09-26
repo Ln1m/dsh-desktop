@@ -1,5 +1,7 @@
 # dsh-desktop
 
+[English](README.en.md) · 中文
+
 ![桌面套壳窗口界面示意](assets/dsh-desktop-window.png)
 ![托盘菜单界面示意](assets/dsh-desktop-tray.png)
 
