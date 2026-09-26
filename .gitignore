@@ -1,0 +1,9 @@
+*.exe
+*.log
+*.bak
+*.bak-*
+*.old-*
+build/packages/
+*.WebView2/
+obj/
+bin/
