@@ -1,5 +1,10 @@
 # dsh-desktop
 
+![桌面套壳窗口界面示意](assets/dsh-desktop-window.png)
+![托盘菜单界面示意](assets/dsh-desktop-tray.png)
+
+*界面示意：按官方主题变量渲染的版式，非实机截图。*
+
 DeepSeek Harness 的 Windows 桌面套壳和系统托盘守护，两个 C# 单文件程序，源码级开源。
 
 | 程序 | 作用 |
