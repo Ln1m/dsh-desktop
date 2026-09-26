@@ -2,8 +2,8 @@
 
 [中文](README.md) · English
 
-![Desktop shell window](assets/dsh-desktop-window.png)
-![Tray menu](assets/dsh-desktop-tray.png)
+![Desktop shell window](assets/dsh-desktop-window-en.png)
+![Tray menu](assets/dsh-desktop-tray-en.png)
 
 *Mockups: layout rendered from the official theme tokens, not screenshots of a running instance.*
 
