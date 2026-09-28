@@ -364,7 +364,45 @@ namespace DshDesktop
             StartServer();
         }
 
+        // 引擎启停的跨进程互斥名：与托盘 dsh-tray 共用，谁先拿到谁负责拉起 3080。
+        private const string EngineGate = "Local\\DSH_Engine_Start_Gate";
+
+        /// <summary>
+        /// 跨进程启动门：外壳与托盘抢同一个命名 Mutex，抢到的一方负责把引擎拉起来，并持有到
+        /// 3080 就绪（或 90 秒超时）才放手；抢不到说明另一方正在启动，直接返回。两边不会再各
+        /// 拉一个引擎撞同一个端口（历史 EADDRINUSE 来源）。启动过程在线程池线程，界面不阻塞 ——
+        /// 调用方原有的等待循环不受影响：等的是「3080 是否就绪」，不关心是谁拉起来的。
+        /// </summary>
         private static void StartServer()
+        {
+            ThreadPool.QueueUserWorkItem(delegate { StartServerGuarded(); });
+        }
+
+        private static void StartServerGuarded()
+        {
+            Mutex gate = null;
+            bool got = false;
+            try
+            {
+                gate = new Mutex(false, EngineGate);
+                try { got = gate.WaitOne(0, false); }
+                catch (AbandonedMutexException) { got = true; }
+                if (!got) return;
+                if (PortOpen()) return;
+                LaunchEngineProcess();
+                for (int i = 0; i < 180 && !PortOpen(); i++) Thread.Sleep(500);
+            }
+            catch
+            {
+            }
+            finally
+            {
+                if (got) { try { gate.ReleaseMutex(); } catch { } }
+                if (gate != null) { try { gate.Close(); } catch { } }
+            }
+        }
+
+        private static void LaunchEngineProcess()
         {
             try
             {
@@ -392,8 +430,7 @@ namespace DshDesktop
             }
             catch (Exception ex)
             {
-                MessageBox.Show("启动 DeepSeek Harness 服务失败：\n" + ex.Message,
-                    "DeepSeek Harness", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                AppendEngineLog(WebErrLogPath, "[desktop] 启动引擎失败：" + ex.Message);
             }
         }
 

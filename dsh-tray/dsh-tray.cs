@@ -83,6 +83,8 @@ namespace DshTray
         public static readonly string LogFile  = Root + "\\dsh-tray\\logs\\web.log";
         public const int EnginePort  = 3080;   // 引擎（Web UI）
         public const int LanPort     = 3081;   // 手机局域网反代（dsh-wifi-access 插件内）
+        // 引擎启停的跨进程互斥名：托盘与 dsh-desktop 共用，谁先拿到谁负责拉起 3080。
+        public const string EngineGate = "Local\\DSH_Engine_Start_Gate";
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -642,7 +644,7 @@ namespace DshTray
         private readonly TrayUi _ui;
         private readonly System.Windows.Forms.Timer _watch;
         private readonly System.Windows.Forms.Timer _bootTimer;
-        private bool _starting;
+        private volatile bool _starting;
         private bool _quitting;
 
         public TrayContext()
@@ -661,8 +663,9 @@ namespace DshTray
             _watch.Tick += delegate { RefreshStatus(); };
             _watch.Start();
 
-            // 登录或被 dsh-desktop 拉起后延迟一次引擎自检。8 秒是留给同时启动的
-            // dsh-desktop 先把自己引擎起完的窗口期，避免两边抢同一端口（历史 EADDRINUSE 来源）。
+            // 登录或被 dsh-desktop 拉起后延迟一次引擎自检：端口不通才拉起。
+            // 是否真由本进程启动由跨进程启动门（Cfg.EngineGate）裁定 —— 这里的延迟只管时机，
+            // 不再承担「躲开 dsh-desktop 的启动窗口」这种正确性职责，慢机器也能正确工作。
             _bootTimer = new System.Windows.Forms.Timer();
             _bootTimer.Interval = 8000;
             _bootTimer.Tick += delegate
@@ -805,8 +808,27 @@ namespace DshTray
             if (_starting || _quitting) return;
             _starting = true;
             RefreshStatus();
+            ThreadPool.QueueUserWorkItem(delegate { StartDshGuarded(); });
+        }
+
+        /// <summary>
+        /// 跨进程启动门：托盘与 dsh-desktop 抢同一个命名 Mutex，抢到的一方负责把引擎拉起来，
+        /// 并持有到 3080 就绪（或 90 秒超时）才放手；抢不到说明另一方正在启动，直接返回。
+        /// 两边不会再各拉一个引擎撞同一个端口（历史 EADDRINUSE 来源），启动时机也不再依赖固定延迟。
+        /// 全过程在线程池线程，托盘菜单与状态刷新不被阻塞。
+        /// </summary>
+        private void StartDshGuarded()
+        {
+            Mutex gate = null;
+            bool got = false;
             try
             {
+                gate = new Mutex(false, Cfg.EngineGate);
+                try { got = gate.WaitOne(0, false); }
+                catch (AbandonedMutexException) { got = true; }
+                if (!got) return;
+                if (PortOpen(Cfg.EnginePort)) return;
+
                 Process p = new Process();
                 p.StartInfo.FileName = Cfg.NodeExe;
                 // 2026-09-14: 补 --no-open。dsh web 的 openBrowser 默认 true，托盘自检
@@ -826,16 +848,24 @@ namespace DshTray
                 p.Start();
                 p.BeginOutputReadLine();
                 p.BeginErrorReadLine();
+
+                for (int i = 0; i < 180 && !PortOpen(Cfg.EnginePort) && !_quitting; i++) Thread.Sleep(500);
             }
             catch (Exception ex)
             {
-                _ui.Notify.ShowBalloonTip(3000, "DSH 常驻托盘",
-                    "启动 DSH 服务失败：" + ex.Message, ToolTipIcon.Error);
+                AppendLog("[start] 拉起引擎失败：" + ex.Message);
+                try
+                {
+                    _ui.Notify.ShowBalloonTip(3000, "DSH 常驻托盘",
+                        "启动 DSH 服务失败：" + ex.Message, ToolTipIcon.Error);
+                }
+                catch { }
             }
             finally
             {
                 _starting = false;
-                RefreshStatus();
+                if (got) { try { gate.ReleaseMutex(); } catch { } }
+                if (gate != null) { try { gate.Close(); } catch { } }
             }
         }
 
