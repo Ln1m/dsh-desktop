@@ -2,10 +2,10 @@
 
 [中文](README.md) · English
 
-![Desktop shell window](assets/dsh-desktop-window-en.png)
-![Tray menu](assets/dsh-desktop-tray-en.png)
+![Desktop shell window](assets/dsh-desktop-window.png)
+![Tray menu](assets/dsh-desktop-tray.png)
 
-*Mockups: layout rendered from the official theme tokens, not screenshots of a running instance.*
+*Screenshots of the running DSH desktop shell and its tray menu.*
 
 A Windows desktop shell and system-tray guard for DSH: two single-file C# programs, open-sourced at source level.
 
