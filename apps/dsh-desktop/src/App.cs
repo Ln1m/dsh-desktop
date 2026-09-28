@@ -664,11 +664,163 @@ namespace DshDesktop
             private System.Windows.Forms.Timer _navTimer;  // 导航看门狗
             private System.Windows.Forms.Timer _retryTimer; // 失败后退避重试
             private Label _overlay;
+            // —— 开机片头（2026-09-28）：铺满窗口，盖住"WebView2 还没渲染出 DSH 界面"的那段空白 ——
+            private static readonly string SplashTemplate = Root + @"\\assets\boot-splash";
+            private const string SplashHost = "splash.local";
+            private WebView2 _splash;
+            // —— 右栏内嵌浏览器：主窗体里的一块 WebView2 子控件（不是独立窗口、没有坐标同步）——
+            // 页面（主 WebView2 里的 DSH 右栏面板）用 chrome.webview.postMessage 把面板矩形的
+            // getBoundingClientRect() + dpr 报过来，这里按矩形摆它；面板关掉/切走就隐藏。
+            private WebView2 _embed;
+            private CoreWebView2Environment _embedEnv;
+            private bool _embedBusy;
+            private bool _embedWanted;
+            private string _embedUrl = "";
+            /// <summary>内嵌视图当前是否在加载（导航栏的"重载/停止"靠它切换）。</summary>
+            private bool _embedLoading;
+            /// <summary>内嵌视图当前页标题。</summary>
+            private string _embedTitle = "";
+            /// <summary>多标签：一块 WebView2 子控件 = 一个标签页（共用同一个浏览器进程与 9223 调试口）。</summary>
+            private sealed class EmbedTab
+            {
+                public string Id;
+                public WebView2 View;
+                public string Url = "";
+                public string Title = "";
+                public bool Loading;
+            }
+            /// <summary>加载遮罩：导航期间盖住旧页面（WebView2 默认会一直显示旧页直到新页首帧，
+            /// 面板那边看不到任何动静，观感就是"点了没反应"）。</summary>
+            private sealed class EmbedMask : Control
+            {
+                public double Angle;
+
+                public EmbedMask()
+                {
+                    SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint
+                        | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+                    Visible = false;
+                }
+
+                protected override void OnPaint(PaintEventArgs e)
+                {
+                    Graphics g = e.Graphics;
+                    using (SolidBrush back = new SolidBrush(Color.FromArgb(0x17, 0x18, 0x1C)))
+                    {
+                        g.FillRectangle(back, ClientRectangle);
+                    }
+                    int size = 30;
+                    int cx = Width / 2;
+                    int cy = Height / 2;
+                    if (cx < size || cy < size) return;
+                    g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                    Rectangle box = new Rectangle(cx - size / 2, cy - size / 2, size, size);
+                    using (Pen track = new Pen(Color.FromArgb(0x2A, 0x2E, 0x36), 2.6f))
+                    {
+                        g.DrawEllipse(track, box);
+                    }
+                    // 渐隐尾巴：16 小段拼出约 100° 的弧，尾端渐淡，转起来就是常见的加载环
+                    const int segments = 16;
+                    for (int i = 0; i < segments; i++)
+                    {
+                        int alpha = 10 + (int)(245.0 * (i + 1) / segments);
+                        using (Pen arc = new Pen(Color.FromArgb(alpha, 0x6F, 0xA8, 0xFF), 3f))
+                        {
+                            arc.StartCap = System.Drawing.Drawing2D.LineCap.Round;
+                            arc.EndCap = System.Drawing.Drawing2D.LineCap.Round;
+                            g.DrawArc(arc, box, (float)(Angle + i * 6.0), 8f);
+                        }
+                    }
+                }
+            }
+
+            private EmbedMask _embedMask;
+            /// <summary>延迟露面（180ms）：几百毫秒内就完成的导航不闪遮罩。</summary>
+            private System.Windows.Forms.Timer _embedMaskDelay;
+            /// <summary>延迟撤除（140ms）：JS 重定向紧接着又开一次导航时不闪回旧页。</summary>
+            private System.Windows.Forms.Timer _embedMaskClear;
+            private System.Windows.Forms.Timer _embedMaskSpin;
+            private bool _embedMaskOn;
+            private double _embedMaskAngle;
+            private const int EmbedMaskDelayMs = 180;
+            private const int EmbedMaskClearMs = 140;
+            private readonly List<EmbedTab> _embedTabs = new List<EmbedTab>();
+            private string _embedActiveId = "";
+            private int _embedSerial = 0;
+            /// <summary>当前面板矩形（新标签挂上来就照它摆位）。</summary>
+            private Rectangle _embedBounds = Rectangle.Empty;
+            /// <summary>标签数上限，到顶就不再开新的。</summary>
+            private const int EmbedTabMax = 8;
+            /// <summary>内嵌浏览器自己的 CDP 调试端口（只绑 127.0.0.1）：agent 驱动的是同一块视图，动作直接显示在面板里。</summary>
+            private const string EmbedCdpPort = "9223";
+            /// <summary>主视图（DSH 界面本身）的 CDP 端口（只绑 127.0.0.1）：界面问题直接量 DOM 尺寸，不靠截图猜。</summary>
+            private const string MainCdpPort = "9222";
+            /// <summary>内嵌视图缩放：右栏窄，缩一点才放得下必应那种 768 死版心的首页，观感也更像桌面浏览器。</summary>
+            private const double EmbedZoom = 0.8;
+            /// <summary>导航栏「首页」按钮的去处（与前端起始页一致）。</summary>
+            private const string EmbedHome = "https://limestart.cn/";
+            /// <summary>缩放 ± 的步长。</summary>
+            private const double EmbedZoomStep = 0.1;
+            // —— 收藏夹浮层（2026-09-28）：一块独立的小 WebView2，叠在内嵌视图之上 ——
+            // 内嵌视图是原生子控件，永远盖在页面 DOM 之上，所以收藏夹只有两条路：让画面让位（整页感），
+            // 或者自己也是一块原生控件压在画面上。这里走后者：浮层自带深色页面，画面不再隐藏。
+            private WebView2 _shelf;
+            private bool _shelfBusy;
+            private bool _shelfReady;
+            private bool _shelfWanted;
+            private Rectangle _shelfBounds = Rectangle.Empty;
+            private bool _shelfFlushBusy;
+            private string _shelfItemsJson;
+            private DateTime _shelfShownAt = DateTime.MinValue;
+            private const int ShelfWidth = 300;
+            /// <summary>默认行高/可视行数；面板每次都会带 panelH，这里只是它没带时的兜底。</summary>
+            private const int ShelfRowHeight = 32;
+            private const int ShelfVisibleRows = 10;
+            private const int ShelfMaxHeight = 560;
+            /// <summary>浮层页面：静态骨架，列表由面板数据经 ExecuteScriptAsync 注入。</summary>
+            private const string ShelfHtml = @"<!doctype html><html><head><meta charset='utf-8'><style>
+html,body{margin:0;padding:0;height:100%;overflow:hidden;background:transparent;font:13px/1.5 'Microsoft YaHei UI','Segoe UI',sans-serif;-webkit-user-select:none}
+body{display:flex;box-sizing:border-box}
+/* 子控件的透明只能透到父窗体背景、透不到下面的网页，所以卡片直接铺满控件，只让四个角露出一点点深色 */
+#card{flex:1 1 auto;min-width:0;min-height:0;display:flex;flex-direction:column;background:#1e2024;border:1px solid rgba(255,255,255,.09);border-radius:10px;overflow:hidden;box-shadow:inset 0 1px 0 rgba(255,255,255,.05);visibility:hidden}
+#list{flex:1 1 auto;min-height:0;overflow:auto;padding:6px}
+.row{display:flex;align-items:center;gap:10px;height:32px;padding:0 10px;box-sizing:border-box;border-radius:8px;color:#c6cad3;cursor:default;transition:background .12s ease,color .12s ease}
+.row:hover{background:rgba(255,255,255,.09);color:#fff}
+/* 图标用 div 打底：img 加载失败会画出破图占位，div 的 background-image 失败只会剩底色 */
+.ico{width:18px;height:18px;border-radius:4px;flex:0 0 auto;background-color:rgba(255,255,255,.09);background-size:contain;background-position:center;background-repeat:no-repeat}
+.t{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.empty{padding:12px;color:#7d838d;font-size:12px}
+#list::-webkit-scrollbar{width:10px}
+#list::-webkit-scrollbar-thumb{background:rgba(255,255,255,.14);border-radius:5px}
+#list::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,.24)}
+#list::-webkit-scrollbar-track{background:transparent}
+</style></head><body><div id='card'><div id='list'></div></div><script>
+var box=document.getElementById('list');
+var card=document.getElementById('card');
+function hostOf(u){try{return new URL(u).hostname.replace(/^www\./,'');}catch(e){return u;}}
+function renderShelf(items){
+  card.style.visibility='visible';
+  box.innerHTML='';
+  if(!items||!items.length){var e=document.createElement('div');e.className='empty';e.textContent='-';box.appendChild(e);return;}
+  for(var i=0;i<items.length;i++){(function(it){
+    var r=document.createElement('div');r.className='row';r.title=it.url||'';
+    var im=document.createElement('div');im.className='ico';
+    if(it.icon){im.style.backgroundImage='url(""' + it.icon + '"")';im.style.backgroundColor='transparent';}
+    var t=document.createElement('span');t.className='t';t.textContent=it.title||hostOf(it.url||'')||'';
+    r.appendChild(im);r.appendChild(t);
+    r.onclick=function(){chrome.webview.postMessage({pick:it.url});};
+    box.appendChild(r);
+  })(items[i]);}
+}
+document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webview.postMessage({close:true});});
+</script></body></html>";
 
             public MainForm()
             {
                 Text = "DeepSeek Harness";
                 AutoScaleMode = AutoScaleMode.None;
+                // 浮层控件透明区透出来的就是这个颜色：深色才像卡片阴影，系统默认浅灰会是一圈发灰的边
+                BackColor = Color.FromArgb(0x18, 0x19, 0x1D);
                 // Default window: 75% of the working-area width, 16:9 aspect ratio,
                 // centered on the primary screen (physical pixels, PMv2-aware).
                 Rectangle wa = Screen.PrimaryScreen.WorkingArea;
@@ -711,6 +863,14 @@ namespace DshDesktop
                 _overlay.Text = "正在连接 DSH 服务…";
                 _overlay.Visible = false;
                 Controls.Add(_overlay);
+                // 开机片头盖在最上层：窗口一出现就有画面，直到 DSH 界面自己渲染出来
+                EnsureSplashRoot();
+                _splash = new WebView2();
+                _splash.Dock = DockStyle.Fill;
+                _splash.Visible = true;
+                try { _splash.DefaultBackgroundColor = Color.Black; } catch { }
+                Controls.Add(_splash);
+                _splash.BringToFront();
                 Shown += OnShown;
             }
 
@@ -726,11 +886,23 @@ namespace DshDesktop
                     }
                     _navTimer.Stop();
                     _navTimer.Start();
-                    if (_overlay != null)
+                    // 首次导航由开机片头盖着，不再叠一块纯色遮罩；一旦要重试就让位给可读的文字提示
+                    if (_attempt == 0)
                     {
-                        _overlay.Visible = true;
-                        _overlay.Text = "正在连接 DSH 服务…" + Environment.NewLine + reason;
+                        if (_overlay != null) _overlay.Visible = false;
+                        if (_splash != null) _splash.Visible = true;
                     }
+                    else
+                    {
+                        HideSplash();
+                        if (_overlay != null)
+                        {
+                            _overlay.Visible = true;
+                            _overlay.Text = "正在连接 DSH 服务…" + Environment.NewLine + reason;
+                        }
+                    }
+                    // 主页面要重载了：先把内嵌浏览器收掉，别让它盖住加载遮罩（页面回来后客户端会重新报矩形）
+                    HideEmbed();
                     web.Source = new Uri(ResolveWebUrl());
                 }
                 catch (Exception ex)
@@ -747,7 +919,12 @@ namespace DshDesktop
                 if (_navTimer != null) _navTimer.Stop();
                 _timeoutRetries++;
                 if (!Program.PortOpen()) Program.StartServer();
-                if (_overlay != null) _overlay.Text = "后端还没就绪，正在重试…";
+                HideSplash();
+                if (_overlay != null)
+                {
+                    _overlay.Visible = true;
+                    _overlay.Text = "后端还没就绪，正在重试…";
+                }
                 ScheduleRetry();
             }
 
@@ -757,11 +934,17 @@ namespace DshDesktop
                 if (e.IsSuccess)
                 {
                     if (_overlay != null) _overlay.Visible = false;
+                    ReleaseSplashToUser();
                     return;
                 }
                 // 失败：短暂等一次再重试；若引擎已不在，顺手把它拉起来
                 if (!Program.PortOpen()) Program.StartServer();
-                if (_overlay != null) _overlay.Text = "页面加载失败，正在重试…";
+                HideSplash();
+                if (_overlay != null)
+                {
+                    _overlay.Visible = true;
+                    _overlay.Text = "页面加载失败，正在重试…";
+                }
                 ScheduleRetry();
             }
 
@@ -787,6 +970,91 @@ namespace DshDesktop
             }
 
             /// <summary>
+            /// DSH 界面已经能操作了：片头不再由"DSH 是否就绪"决定去留 —— 露出右上角的「跳过」，
+            /// 这一遍播完（或用户点跳过）才撤。片头当时若还在间隔/加载中，页面会直接回报已结束。
+            /// </summary>
+            private void ReleaseSplashToUser()
+            {
+                if (_splash == null || !_splash.Visible) return;
+                if (_splash.CoreWebView2 == null)
+                {
+                    HideSplash();
+                    return;
+                }
+                try
+                {
+                    _splash.CoreWebView2.ExecuteScriptAsync("window.__splashReady&&window.__splashReady()");
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine("splash ready failed: " + ex.Message);
+                    HideSplash();
+                }
+            }
+
+            private void HideSplash()
+            {
+                try
+                {
+                    if (_splash != null) _splash.Visible = false;
+                }
+                catch
+                {
+                }
+            }
+
+            /// <summary>片头资产摊到 ~/.dsh/boot-splash：页面每次用模板覆盖，视频与配置归用户。</summary>
+            private static void EnsureSplashRoot()
+            {
+                try
+                {
+                    string root = SplashRoot();
+                    Directory.CreateDirectory(root);
+                    Directory.CreateDirectory(Path.Combine(root, "videos"));
+                    File.Copy(Path.Combine(SplashTemplate, "index.html"), Path.Combine(root, "index.html"), true);
+                    string cfg = Path.Combine(root, "config.json");
+                    if (!File.Exists(cfg))
+                    {
+                        File.WriteAllText(cfg,
+                            "{\r\n  \"video\": \"cyberpunk-intro.mp4\",\r\n  \"gapMs\": 3000\r\n}\r\n",
+                            new System.Text.UTF8Encoding(false));
+                    }
+                    string def = Path.Combine(root, "videos", "cyberpunk-intro.mp4");
+                    if (!File.Exists(def))
+                    {
+                        File.Copy(Path.Combine(SplashTemplate, "cyberpunk-intro.mp4"), def, true);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine("splash root failed: " + ex.Message);
+                }
+            }
+
+            private static string SplashRoot()
+            {
+                return Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                    ".dsh", "boot-splash");
+            }
+
+            /// <summary>页面侧的两条消息：splash-skip（用户点跳过）、splash-ended（这一遍播完了）。</summary>
+            private void OnSplashMessage(object sender, CoreWebView2WebMessageReceivedEventArgs e)
+            {
+                string json;
+                try
+                {
+                    json = e.WebMessageAsJson;
+                }
+                catch
+                {
+                    return;
+                }
+                if (json == null) return;
+                if (json.IndexOf("splash-skip") >= 0 || json.IndexOf("splash-ended") >= 0) HideSplash();
+            }
+
+            /// <summary>
             /// WebView2 渲染/GPU 子进程崩溃后，控件会变成一块空白（看起来就是"白屏/黑屏"）。
             /// 这里记日志并自动 Reload 一次，让用户不必关窗口重开。
             /// </summary>
@@ -806,8 +1074,909 @@ namespace DshDesktop
                 }
             }
 
+            /// <summary>页面报来的 CSS 矩形 → 本窗体客户区的物理矩形；倍率优先用「主 WebView2 物理宽 ÷ 页面视口 CSS 宽」。</summary>
+            private Rectangle EmbedRect(Dictionary<string, object> msg)
+            {
+                double vw = AsDouble(msg.ContainsKey("vw") ? msg["vw"] : null, 0);
+                double dpr = AsDouble(msg.ContainsKey("dpr") ? msg["dpr"] : null, 1);
+                double scale = dpr > 0.5 ? dpr : 1.0;
+                int viewW = web.ClientSize.Width > 0 ? web.ClientSize.Width : ClientRectangle.Width;
+                if (vw > 0 && viewW > 0)
+                {
+                    double measured = viewW / vw;
+                    if (measured > 0.5 && measured < 8) scale = measured;
+                }
+                int cx = (int)Math.Round(AsDouble(msg.ContainsKey("x") ? msg["x"] : null, 0) * scale);
+                int cy = (int)Math.Round(AsDouble(msg.ContainsKey("y") ? msg["y"] : null, 0) * scale);
+                int cw = (int)Math.Round(AsDouble(msg.ContainsKey("w") ? msg["w"] : null, 0) * scale);
+                int ch = (int)Math.Round(AsDouble(msg.ContainsKey("h") ? msg["h"] : null, 0) * scale);
+                if (cw < 40 || ch < 40)
+                {
+                    return Rectangle.Empty;
+                }
+                Rectangle client = ClientRectangle;
+                if (cx < 0) cx = 0;
+                if (cy < 0) cy = 0;
+                if (cx + cw > client.Width) cw = client.Width - cx;
+                if (cy + ch > client.Height) ch = client.Height - cy;
+                if (cw < 40 || ch < 40)
+                {
+                    return Rectangle.Empty;
+                }
+                return new Rectangle(cx, cy, cw, ch);
+            }
+
+            private static double AsDouble(object value, double fallback)
+            {
+                if (value == null) return fallback;
+                try
+                {
+                    return Convert.ToDouble(value, System.Globalization.CultureInfo.InvariantCulture);
+                }
+                catch
+                {
+                    return fallback;
+                }
+            }
+
+            /// <summary>页面 → 外壳的唯一通道：只处理 kind = dsh-embed 的消息。</summary>
+            private void OnWebMessage(object sender, CoreWebView2WebMessageReceivedEventArgs e)
+            {
+                string json;
+                try { json = e.WebMessageAsJson; }
+                catch { return; }
+                if (string.IsNullOrEmpty(json) || json.IndexOf("dsh-embed", StringComparison.Ordinal) < 0) return;
+                Dictionary<string, object> msg;
+                try { msg = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(json); }
+                catch { return; }
+                if (msg == null || !msg.ContainsKey("kind") || Convert.ToString(msg["kind"]) != "dsh-embed") return;
+                string cmd = msg.ContainsKey("cmd") ? Convert.ToString(msg["cmd"]) : "";
+                if (cmd == "hide")
+                {
+                    _embedWanted = false;
+                    HideEmbed();
+                    return;
+                }
+                Rectangle rect = EmbedRect(msg);
+                // 收藏夹浮层与内嵌视图的显示状态无关：先处理，别碰 _embedWanted
+                if (cmd == "shelf")
+                {
+                    ShelfCommand(msg, rect);
+                    return;
+                }
+                // 面板收藏当前页之前来问一句：这页的图标在哪。这个只能有页面上下文的这边答
+                if (cmd == "icon")
+                {
+                    ReadEmbedIcon();
+                    return;
+                }
+                _embedWanted = true;
+                if (cmd == "open")
+                {
+                    ShowEmbed(msg.ContainsKey("url") ? Convert.ToString(msg["url"]) : "", rect);
+                    return;
+                }
+                if (cmd == "nav")
+                {
+                    EmbedNav(msg.ContainsKey("action") ? Convert.ToString(msg["action"]) : "");
+                    return;
+                }
+                if (cmd == "newTab")
+                {
+                    _embedWanted = true;
+                    if (!rect.IsEmpty) _embedBounds = rect;
+                    NewEmbedTab(msg.ContainsKey("url") ? Convert.ToString(msg["url"]) : "", true);
+                    return;
+                }
+                if (cmd == "closeTab")
+                {
+                    CloseEmbedTab(msg.ContainsKey("id") ? Convert.ToString(msg["id"]) : "");
+                    return;
+                }
+                if (cmd == "selectTab")
+                {
+                    SelectEmbedTab(msg.ContainsKey("id") ? Convert.ToString(msg["id"]) : "");
+                    return;
+                }
+                if (cmd == "rect" && _embed != null && !rect.IsEmpty)
+                {
+                    _embedBounds = rect;
+                    _embed.Bounds = rect;
+                    if (!_embed.Visible && !_embedMaskOn) _embed.Visible = true;
+                    _embed.BringToFront();
+                    SyncEmbedMask();
+                    BringShelfFront();
+                }
+            }
+
+            /// <summary>内嵌视图的状态推回面板：地址、标题、可否前进后退、加载中、缩放。</summary>
+            private void PushEmbedState()
+            {
+                try
+                {
+                    if (web == null || web.CoreWebView2 == null) return;
+                    if (!_embedWanted) return;
+                    CoreWebView2 core = _embed == null ? null : _embed.CoreWebView2;
+                    Dictionary<string, object> payload = new Dictionary<string, object>();
+                    payload["kind"] = "dsh-embed-state";
+                    payload["url"] = core == null ? "" : (core.Source ?? "");
+                    EmbedTab shown = ActiveTab();
+                    payload["title"] = shown == null ? (_embedTitle ?? "") : (shown.Title ?? "");
+                    payload["canGoBack"] = core != null && core.CanGoBack;
+                    payload["canGoForward"] = core != null && core.CanGoForward;
+                    payload["loading"] = _embedLoading;
+                    payload["zoom"] = _embed == null ? EmbedZoom : Math.Round(_embed.ZoomFactor, 3);
+                    List<Dictionary<string, object>> tabs = new List<Dictionary<string, object>>();
+                    for (int i = 0; i < _embedTabs.Count; i++)
+                    {
+                        EmbedTab item = _embedTabs[i];
+                        Dictionary<string, object> row = new Dictionary<string, object>();
+                        row["id"] = item.Id;
+                        row["title"] = string.IsNullOrEmpty(item.Title) ? (string.IsNullOrEmpty(item.Url) ? "新标签" : item.Url) : item.Title;
+                        row["url"] = item.Url ?? "";
+                        row["active"] = item.Id == _embedActiveId;
+                        row["loading"] = item.Loading;
+                        tabs.Add(row);
+                    }
+                    payload["tabs"] = tabs;
+                    web.CoreWebView2.PostWebMessageAsJson(new JavaScriptSerializer().Serialize(payload));
+                }
+                catch
+                {
+                }
+            }
+
+            /// <summary>导航栏来的动作：全部由外壳这边的同一块 WebView2 执行。</summary>
+            private void EmbedNav(string action)
+            {
+                if (_embed == null || _embed.CoreWebView2 == null) return;
+                CoreWebView2 core = _embed.CoreWebView2;
+                try
+                {
+                    if (action == "back")
+                    {
+                        if (core.CanGoBack) core.GoBack();
+                    }
+                    else if (action == "forward")
+                    {
+                        if (core.CanGoForward) core.GoForward();
+                    }
+                    else if (action == "reload")
+                    {
+                        core.Reload();
+                    }
+                    else if (action == "stop")
+                    {
+                        core.Stop();
+                    }
+                    else if (action == "home")
+                    {
+                        core.Navigate(EmbedHome);
+                    }
+                    else if (action == "zoomIn")
+                    {
+                        SetEmbedZoom(_embed.ZoomFactor + EmbedZoomStep);
+                    }
+                    else if (action == "zoomOut")
+                    {
+                        SetEmbedZoom(_embed.ZoomFactor - EmbedZoomStep);
+                    }
+                }
+                catch
+                {
+                }
+                PushEmbedState();
+            }
+
+            /// <summary>缩放钳到 0.25-3，改完立刻回传（按钮 title 上显示百分比）。</summary>
+            private void SetEmbedZoom(double value)
+            {
+                if (_embed == null) return;
+                double zoom = Math.Round(value, 2);
+                if (zoom < 0.25) zoom = 0.25;
+                if (zoom > 3.0) zoom = 3.0;
+                try { _embed.ZoomFactor = zoom; }
+                catch { }
+            }
+
+            private void HideEmbed()
+            {
+                for (int i = 0; i < _embedTabs.Count; i++)
+                {
+                    try { _embedTabs[i].View.Visible = false; }
+                    catch { }
+                }
+                try { if (_embed != null) _embed.Visible = false; }
+                catch { }
+                // 面板整块让位（收藏夹小卡片浮层/切走）：加载遮罩也一起收掉，且别把画面放回来
+                HideEmbedMask(false);
+                HideShelf(true);
+            }
+
+            /// <summary>该不该有遮罩：面板在要画面、当前标签在加载、矩形有效。</summary>
+            private bool EmbedMaskWanted()
+            {
+                return _embedWanted && _embedLoading && _embed != null && !_embedBounds.IsEmpty;
+            }
+
+            /// <summary>导航一开始就调：先等 180ms，慢加载才真的露面。</summary>
+            private void ArmEmbedMask()
+            {
+                if (_embedMaskClear != null) _embedMaskClear.Stop();
+                if (!EmbedMaskWanted())
+                {
+                    HideEmbedMask();
+                    return;
+                }
+                if (_embedMaskOn)
+                {
+                    SyncEmbedMask();
+                    return;
+                }
+                if (_embedMaskDelay == null)
+                {
+                    _embedMaskDelay = new System.Windows.Forms.Timer { Interval = EmbedMaskDelayMs };
+                    _embedMaskDelay.Tick += delegate
+                    {
+                        _embedMaskDelay.Stop();
+                        if (EmbedMaskWanted()) ShowEmbedMask();
+                    };
+                }
+                _embedMaskDelay.Stop();
+                _embedMaskDelay.Start();
+            }
+
+            /// <summary>遮罩在显示时又报了新矩形（拖右栏）：跟着走。</summary>
+            private void SyncEmbedMask()
+            {
+                if (!_embedMaskOn || _embedMask == null) return;
+                try { _embedMask.Bounds = _embedBounds; } catch { }
+                try { if (_embed.Visible) _embed.Visible = false; } catch { }
+                try { _embedMask.BringToFront(); } catch { }
+                BringShelfFront();
+            }
+
+            private void ShowEmbedMask()
+            {
+                if (_embedMask == null)
+                {
+                    _embedMask = new EmbedMask();
+                    Controls.Add(_embedMask);
+                }
+                if (!EmbedMaskWanted()) return;
+                _embedMaskAngle = 0;
+                _embedMask.Angle = 0;
+                try { _embedMask.Bounds = _embedBounds; } catch { }
+                _embedMaskOn = true;
+                // 遮罩是普通 GDI 控件，WebView2 是原生子控件：藏掉画面才保证遮罩一定在它上面
+                try { if (_embed != null) _embed.Visible = false; } catch { }
+                try { _embedMask.Visible = true; _embedMask.BringToFront(); } catch { }
+                BringShelfFront();
+                if (_embedMaskSpin == null)
+                {
+                    _embedMaskSpin = new System.Windows.Forms.Timer { Interval = 33 };
+                    _embedMaskSpin.Tick += delegate
+                    {
+                        if (!_embedMaskOn || _embedMask == null) return;
+                        _embedMaskAngle = (_embedMaskAngle + 24.0) % 360.0;
+                        _embedMask.Angle = _embedMaskAngle;
+                        _embedMask.Invalidate();
+                    };
+                }
+                _embedMaskSpin.Start();
+            }
+
+            /// <summary>一次导航完成后不马上撤：等 140ms，紧接着又来一次导航（JS 重定向）就继续盖着。</summary>
+            private void ScheduleEmbedMaskClear()
+            {
+                // 导航已经结束了：还没到 180ms 的延迟露面直接取消，否则快页面会闪一下遮罩
+                if (_embedMaskDelay != null) _embedMaskDelay.Stop();
+                if (_embedMaskClear == null)
+                {
+                    _embedMaskClear = new System.Windows.Forms.Timer { Interval = EmbedMaskClearMs };
+                    _embedMaskClear.Tick += delegate
+                    {
+                        _embedMaskClear.Stop();
+                        HideEmbedMask();
+                    };
+                }
+                _embedMaskClear.Stop();
+                _embedMaskClear.Start();
+            }
+
+            /// <summary>导航结束（成功或失败都算）：撤遮罩，把画面放回来。</summary>
+            private void HideEmbedMask()
+            {
+                HideEmbedMask(true);
+            }
+
+            /// <summary>restore=false 用于面板整块让位：只撤遮罩，别把画面又放出来。</summary>
+            private void HideEmbedMask(bool restore)
+            {
+                if (_embedMaskDelay != null) _embedMaskDelay.Stop();
+                if (_embedMaskClear != null) _embedMaskClear.Stop();
+                if (_embedMaskSpin != null) _embedMaskSpin.Stop();
+                if (!_embedMaskOn) return;
+                _embedMaskOn = false;
+                try { if (_embedMask != null) _embedMask.Visible = false; } catch { }
+                if (!restore) return;
+                try
+                {
+                    if (_embed != null && _embedWanted && !_embedBounds.IsEmpty)
+                    {
+                        _embed.Bounds = _embedBounds;
+                        _embed.Visible = true;
+                        _embed.BringToFront();
+                    }
+                }
+                catch { }
+                BringShelfFront();
+            }
+
+            /// <summary>建一块内嵌 WebView2 子控件（共用一份 CoreWebView2Environment：同一个浏览器进程、同一个 9223 调试口）。</summary>
+            private async Task<WebView2> CreateEmbedView()
+            {
+                if (_embedBusy) return null;
+                _embedBusy = true;
+                WebView2 view = new WebView2();
+                view.Visible = false;
+                view.Name = "embedBrowser" + (_embedSerial + 1).ToString();
+                // 点画面 = 把焦点从收藏夹浮层拿走：浮层跟着收起（浏览器里点别处收起收藏夹的同一种手感）
+                view.GotFocus += delegate { OnEmbedFocus(); };
+                Controls.Add(view);
+                try
+                {
+                    string dir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "embed-profile");
+                    Directory.CreateDirectory(dir);
+                    if (_embedEnv == null)
+                    {
+                        CoreWebView2EnvironmentOptions options = new CoreWebView2EnvironmentOptions
+                        {
+                            AdditionalBrowserArguments = "--remote-debugging-port=" + EmbedCdpPort + " --remote-allow-origins=*"
+                        };
+                        _embedEnv = await CoreWebView2Environment.CreateAsync(null, dir, options);
+                    }
+                    await view.EnsureCoreWebView2Async(_embedEnv);
+                }
+                catch (Exception ex)
+                {
+                    _embedBusy = false;
+                    try { Controls.Remove(view); view.Dispose(); }
+                    catch { }
+                    System.Diagnostics.Debug.WriteLine("embed init failed: " + ex.Message);
+                    return null;
+                }
+                _embedBusy = false;
+                try { view.CoreWebView2.Settings.IsStatusBarEnabled = false; }
+                catch { }
+                try { view.ZoomFactor = EmbedZoom; }
+                catch { }
+                return view;
+            }
+
+            /// <summary>开一个标签页（一块新的 WebView2 子控件）；activate=true 就切过去。</summary>
+            private async void NewEmbedTab(string url, bool activate)
+            {
+                if (_embedTabs.Count >= EmbedTabMax)
+                {
+                    Program.LogResolve("embed tab limit reached (" + EmbedTabMax + ")");
+                    return;
+                }
+                WebView2 view = await CreateEmbedView();
+                if (view == null) return;
+                EmbedTab tab = new EmbedTab();
+                tab.Id = "t" + (++_embedSerial).ToString();
+                tab.View = view;
+                tab.Url = url == null ? "" : url;
+                // target=_blank / window.open：不另开顶层窗口，直接在标签条里多一个标签
+                view.CoreWebView2.NewWindowRequested += delegate(object s2, CoreWebView2NewWindowRequestedEventArgs a2)
+                {
+                    a2.Handled = true;
+                    NewEmbedTab(a2.Uri, true);
+                };
+                view.CoreWebView2.NavigationStarting += delegate(object s3, CoreWebView2NavigationStartingEventArgs a3)
+                {
+                    tab.Loading = true;
+                    // 只有当前可见标签的导航才动画面：后台标签在加载不该把画面遮住
+                    if (tab.Id == _embedActiveId)
+                    {
+                        _embedLoading = true;
+                        ArmEmbedMask();
+                    }
+                    PushEmbedState();
+                };
+                view.CoreWebView2.NavigationCompleted += delegate(object s3, CoreWebView2NavigationCompletedEventArgs a3)
+                {
+                    tab.Loading = false;
+                    if (tab.Id == _embedActiveId)
+                    {
+                        _embedLoading = false;
+                        ScheduleEmbedMaskClear();
+                    }
+                    PushEmbedState();
+                };
+                view.CoreWebView2.SourceChanged += delegate(object s3, CoreWebView2SourceChangedEventArgs a3)
+                {
+                    try { tab.Url = tab.View.CoreWebView2.Source ?? tab.Url; }
+                    catch { }
+                    PushEmbedState();
+                };
+                view.CoreWebView2.HistoryChanged += delegate(object s3, object a3) { PushEmbedState(); };
+                view.CoreWebView2.DocumentTitleChanged += delegate(object s3, object a3)
+                {
+                    try { tab.Title = tab.View.CoreWebView2.DocumentTitle ?? ""; }
+                    catch { }
+                    PushEmbedState();
+                };
+                _embedTabs.Add(tab);
+                if (activate) _embedActiveId = tab.Id;
+                SyncActiveTab();
+                if (tab.Url.Length > 0)
+                {
+                    Program.LogResolve("embed tab open " + tab.Url);
+                    try { view.CoreWebView2.Navigate(tab.Url); }
+                    catch { }
+                }
+                PushEmbedState();
+            }
+
+            /// <summary>关一个标签（控件一起释放）；关的是当前标签就切到左边那个。</summary>
+            private void CloseEmbedTab(string id)
+            {
+                for (int i = 0; i < _embedTabs.Count; i++)
+                {
+                    if (_embedTabs[i].Id != id) continue;
+                    EmbedTab tab = _embedTabs[i];
+                    _embedTabs.RemoveAt(i);
+                    try { Controls.Remove(tab.View); tab.View.Dispose(); }
+                    catch { }
+                    if (_embedActiveId == id) _embedActiveId = _embedTabs.Count > 0 ? _embedTabs[Math.Max(0, i - 1)].Id : "";
+                    SyncActiveTab();
+                    PushEmbedState();
+                    return;
+                }
+            }
+
+            /// <summary>切标签：只有当前那块控件可见。</summary>
+            private void SelectEmbedTab(string id)
+            {
+                _embedActiveId = id;
+                SyncActiveTab();
+                try { if (_embed != null) _embed.BringToFront(); }
+                catch { }
+                BringShelfFront();
+                PushEmbedState();
+            }
+
+            private EmbedTab ActiveTab()
+            {
+                for (int i = 0; i < _embedTabs.Count; i++)
+                {
+                    if (_embedTabs[i].Id == _embedActiveId) return _embedTabs[i];
+                }
+                return _embedTabs.Count > 0 ? _embedTabs[0] : null;
+            }
+
+            /// <summary>当前标签的字段同步到 _embed* 与可见性（只有当前那块控件可见，且照面板矩形摆好）。</summary>
+            private void SyncActiveTab()
+            {
+                EmbedTab tab = ActiveTab();
+                if (tab == null)
+                {
+                    _embed = null;
+                    _embedActiveId = "";
+                    _embedUrl = "";
+                    _embedTitle = "";
+                    _embedLoading = false;
+                    HideEmbedMask(false);
+                    return;
+                }
+                _embedActiveId = tab.Id;
+                _embed = tab.View;
+                _embedUrl = tab.Url ?? "";
+                _embedTitle = tab.Title ?? "";
+                _embedLoading = tab.Loading;
+                for (int i = 0; i < _embedTabs.Count; i++)
+                {
+                    try { _embedTabs[i].View.Visible = _embedWanted && _embedTabs[i].Id == _embedActiveId && !_embedBounds.IsEmpty; }
+                    catch { }
+                }
+                try { if (_embed != null && _embed.Visible) _embed.Bounds = _embedBounds; }
+                catch { }
+                // 关键：WinForms 里后 Add 的控件在 z 序最底，不抬上来就被主视图盖住（页面在跑却什么都看不到）
+                try { if (_embed != null && _embed.Visible) _embed.BringToFront(); }
+                catch { }
+                // 切到一个还在加载的标签：遮罩该在就在；切到已加载完的标签：撤掉并把画面放回来
+                if (_embedLoading) ArmEmbedMask(); else HideEmbedMask();
+                BringShelfFront();
+            }
+
+            /// <summary>把当前标签摆到面板矩形上并导航（面板每次上报矩形都走这里）。</summary>
+            private void ShowEmbed(string url, Rectangle rect)
+            {
+                try
+                {
+                    _embedWanted = true;
+                    if (!rect.IsEmpty) _embedBounds = rect;
+                    // 控件还在、但它的浏览器进程已经没了（调试口被清 / 进程崩过）：把这块标签整块丢掉重建
+                    for (int i = _embedTabs.Count - 1; i >= 0; i--)
+                    {
+                        bool dead = false;
+                        try { dead = _embedTabs[i].View.CoreWebView2 == null || _embedTabs[i].View.IsDisposed; }
+                        catch { dead = true; }
+                        if (dead)
+                        {
+                            try { Controls.Remove(_embedTabs[i].View); _embedTabs[i].View.Dispose(); }
+                            catch { }
+                            _embedTabs.RemoveAt(i);
+                            Program.LogResolve("embed control dead, dropped");
+                        }
+                    }
+                    EmbedTab tab = ActiveTab();
+                    if (tab == null)
+                    {
+                        NewEmbedTab(string.IsNullOrEmpty(url) ? EmbedHome : url, true);
+                        return;
+                    }
+                    SyncActiveTab();
+                    if (!string.IsNullOrEmpty(url) && url != tab.Url)
+                    {
+                        tab.Url = url;
+                        Program.LogResolve("embed open " + url);
+                        try { tab.View.CoreWebView2.Navigate(url); }
+                        catch { }
+                    }
+                    if (!_embedBounds.IsEmpty)
+                    {
+                        try { tab.View.Bounds = _embedBounds; }
+                        catch { }
+                    }
+                    try { tab.View.Visible = !_embedMaskOn; tab.View.BringToFront(); }
+                    catch { }
+                    SyncEmbedMask();
+                    BringShelfFront();
+                    PushEmbedState();
+                }
+                catch (Exception ex)
+                {
+                    _embedBusy = false;
+                    System.Diagnostics.Debug.WriteLine("embed show failed: " + ex.Message);
+                }
+            }
+
+            /// <summary>收藏夹浮层：显示 / 更新位置 / 收起。面板打开时带 items，之后每次上报矩形只带位置。</summary>
+            private void ShelfCommand(Dictionary<string, object> msg, Rectangle rect)
+            {
+                // 面板挂载时探一次：认这条命令的外壳走浮层，旧外壳继续用面板里的小卡片，收藏夹不会变成"点了没反应"
+                if (AsBool(msg.ContainsKey("probe") ? msg["probe"] : null, false))
+                {
+                    PostToPanel("{\"kind\":\"dsh-embed-shelf\",\"ack\":true}");
+                    return;
+                }
+                bool show = AsBool(msg.ContainsKey("show") ? msg["show"] : null, false);
+                if (!show || rect.IsEmpty)
+                {
+                    HideShelf(true);
+                    return;
+                }
+                // items 的运行时类型随序列化路径变（object[] / List<object>／嵌套字典），按 IEnumerable 收，别用 as object[]
+                object raw = msg.ContainsKey("items") ? msg["items"] : null;
+                int wanted = (int)AsDouble(msg.ContainsKey("panelH") ? msg["panelH"] : null, 0);
+                Rectangle box = ShelfBounds(rect, wanted);
+                if (box.IsEmpty)
+                {
+                    HideShelf(true);
+                    return;
+                }
+                // 先算好尺寸再建控件：让 WebView2 一出生就是这个视口。否则页面先按默认小尺寸排一遍、
+                // 拿到真尺寸再重排，打开时就会看到文字先挤在中间再弹回左边
+                EnsureShelf(box);
+                if (_shelf == null) return;
+                _shelfBounds = box;
+                _shelfWanted = true;
+                if (raw != null)
+                {
+                    List<object> items = new List<object>();
+                    System.Collections.IEnumerable seq = raw as System.Collections.IEnumerable;
+                    if (seq != null && !(raw is string))
+                    {
+                        foreach (object one in seq) items.Add(one);
+                    }
+                    Program.LogResolve("shelf rows " + items.Count + " (" + raw.GetType().Name + ")");
+                    _shelfItemsJson = new JavaScriptSerializer().Serialize(items);
+                }
+                _shelfShownAt = DateTime.Now;
+                FlushShelf();
+            }
+
+            /// <summary>浮层矩形：贴面板右上角，宽度固定，高度按条目数自适应（超上限就内部滚动）。</summary>
+            private Rectangle ShelfBounds(Rectangle stage, int wanted)
+            {
+                int maxH = Math.Min(ShelfMaxHeight, Math.Max(60, stage.Height - 12));
+                // 高度由面板给（panelH）；没给就按默认可视行数算
+                int h = wanted > 0 ? wanted : (8 + ShelfVisibleRows * ShelfRowHeight);
+                if (h > maxH) h = maxH;
+                int x = stage.Right - ShelfWidth - 6;
+                int y = stage.Y + 6;
+                Rectangle client = ClientRectangle;
+                if (x < 0) x = 0;
+                if (y < 0) y = 0;
+                int w = Math.Min(ShelfWidth, client.Width - x);
+                if (y + h > client.Height) h = client.Height - y;
+                if (w < 80 || h < 40) return Rectangle.Empty;
+                return new Rectangle(x, y, w, h);
+            }
+
+            /// <summary>按需建浮层控件（复用内嵌浏览器的环境：同一个浏览器进程、同一个 9223 调试口）。</summary>
+            private async void EnsureShelf(Rectangle initBounds)
+            {
+                if (_shelf != null || _shelfBusy) return;
+                _shelfBusy = true;
+                WebView2 view = new WebView2();
+                view.Visible = false;
+                // 控件一出生就是最终尺寸：WebView2 拿它当初始视口，页面只排一次版
+                if (!initBounds.IsEmpty) view.Bounds = initBounds;
+                view.Name = "embedShelf";
+                Controls.Add(view);
+                _shelf = view;
+                try
+                {
+                    string dir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "embed-profile");
+                    Directory.CreateDirectory(dir);
+                    if (_embedEnv == null)
+                    {
+                        CoreWebView2EnvironmentOptions options = new CoreWebView2EnvironmentOptions
+                        {
+                            AdditionalBrowserArguments = "--remote-debugging-port=" + EmbedCdpPort + " --remote-allow-origins=*"
+                        };
+                        _embedEnv = await CoreWebView2Environment.CreateAsync(null, dir, options);
+                    }
+                    await view.EnsureCoreWebView2Async(_embedEnv);
+                }
+                catch (Exception ex)
+                {
+                    _shelfBusy = false;
+                    try { Controls.Remove(view); view.Dispose(); }
+                    catch { }
+                    _shelf = null;
+                    Program.LogResolve("shelf init failed: " + ex.Message);
+                    return;
+                }
+                _shelfBusy = false;
+                // 圆角与投影靠 CSS：控件本体透明，四角露出下面的网页
+                try { view.DefaultBackgroundColor = Color.Transparent; }
+                catch { }
+                try { view.CoreWebView2.Settings.IsStatusBarEnabled = false; }
+                catch { }
+                view.CoreWebView2.WebMessageReceived += OnShelfMessage;
+                view.CoreWebView2.NavigationCompleted += delegate(object s2, CoreWebView2NavigationCompletedEventArgs a2)
+                {
+                    _shelfReady = true;
+                    FlushShelf();
+                };
+                view.CoreWebView2.NavigateToString(ShelfHtml);
+            }
+
+            /// <summary>把当前矩形与条目推给浮层；页面还没加载完就等 NavigationCompleted 再来一次。</summary>
+            private async void FlushShelf()
+            {
+                if (!_shelfReady || _shelf == null || !_shelfWanted) return;
+                string json = _shelfItemsJson;
+                if (json != null && !_shelfFlushBusy)
+                {
+                    _shelfFlushBusy = true;
+                    _shelfItemsJson = null;
+                    try { _shelf.Bounds = _shelfBounds; } catch { }
+                    // 先把列表画好、留一帧给它合成，再露面：直接显示的话先闪一个空卡片，看着就像"卡一下"
+                    try { await _shelf.CoreWebView2.ExecuteScriptAsync("renderShelf(" + json + ")"); } catch { }
+                    await Task.Delay(20);
+                    _shelfFlushBusy = false;
+                    if (_shelf == null || !_shelfWanted) return;
+                }
+                try
+                {
+                    _shelf.Bounds = _shelfBounds;
+                    if (!_shelf.Visible)
+                    {
+                        _shelf.Visible = true;
+                        _shelf.BringToFront();
+                        _shelf.Focus();
+                        _shelfShownAt = DateTime.Now;
+                    }
+                }
+                catch { }
+            }
+
+            /// <summary>收起浮层。notify=true 时告诉面板「是外壳这边关的」，让收藏夹按钮复位。</summary>
+            private void HideShelf(bool notify)
+            {
+                bool wasOpen = _shelfWanted || (_shelf != null && _shelf.Visible);
+                _shelfWanted = false;
+                _shelfItemsJson = null;
+                try { if (_shelf != null) _shelf.Visible = false; }
+                catch { }
+                if (notify && wasOpen) PostToPanel("{\"kind\":\"dsh-embed-shelf\",\"closed\":true}");
+            }
+
+            /// <summary>内嵌视图刚抬到最前，浮层要跟着再抬一次，否则被压在下面。</summary>
+            private void BringShelfFront()
+            {
+                try { if (_shelf != null && _shelf.Visible) _shelf.BringToFront(); }
+                catch { }
+            }
+
+            /// <summary>焦点离开浮层（用户点了画面或主界面）就收起；刚打开的 250ms 内不响应，免得被自己的 Focus 误判。</summary>
+            private void OnEmbedFocus()
+            {
+                if (!_shelfWanted) return;
+                if ((DateTime.Now - _shelfShownAt).TotalMilliseconds < 250) return;
+                HideShelf(true);
+            }
+
+            /// <summary>浮层里的动作：点某条 → 交给面板导航；Esc → 收起。</summary>
+            private void OnShelfMessage(object sender, CoreWebView2WebMessageReceivedEventArgs e)
+            {
+                string json;
+                try { json = e.WebMessageAsJson; }
+                catch { return; }
+                string pick = "";
+                bool close = false;
+                try
+                {
+                    Dictionary<string, object> msg = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(json);
+                    if (msg != null)
+                    {
+                        if (msg.ContainsKey("pick")) pick = Convert.ToString(msg["pick"]);
+                        if (msg.ContainsKey("close")) close = AsBool(msg["close"], false);
+                    }
+                }
+                catch { return; }
+                if (pick != null && pick.Length > 0)
+                {
+                    HideShelf(false);
+                    PostToPanel("{\"kind\":\"dsh-embed-shelf\",\"url\":" + new JavaScriptSerializer().Serialize(pick) + "}");
+                    return;
+                }
+                if (close) HideShelf(true);
+            }
+
+            /// <summary>把当前标签页的真实图标地址报给面板：HTML 里的 link[rel*=icon] 才准，
+            /// 直接猜 /favicon.ico 经常 404/403（站点把图标放在 CDN 上，青柠就是这种）。</summary>
+            private async void ReadEmbedIcon()
+            {
+                string icon = "";
+                string pageUrl = "";
+                try
+                {
+                    if (_embed != null && _embed.CoreWebView2 != null)
+                    {
+                        pageUrl = _embed.CoreWebView2.Source ?? "";
+                        string raw = await _embed.CoreWebView2.ExecuteScriptAsync(
+                            "(function(){var l=document.querySelector('link[rel*=icon]');" +
+                            "if(l&&l.href)return l.href;return location.origin+'/favicon.ico';})()");
+                        icon = UnquoteJson(raw);
+                    }
+                }
+                catch { }
+                // CDN 普遍有防盗链（青柠那张不带 Referer 就是 403），而浮层页面是 about:blank，
+                // 自己发请求既没有 Referer 也过不了 CORS —— 所以由这边按页面 Referer 把图抓下来，
+                // 缩到 32×32 转成内嵌 data URL 交给面板，浮层从此不联网取图。
+                string inlined = await Task.Run(() => FetchIconData(icon, pageUrl));
+                string payload = inlined.Length > 0 ? inlined : icon;
+                Program.LogResolve("embed icon " + (icon.Length > 0 ? icon : "(none)")
+                    + (inlined.Length > 0 ? " [inlined " + inlined.Length + "]" : " [inline failed]"));
+                PostToPanel("{\"kind\":\"dsh-embed-icon\",\"icon\":" + new JavaScriptSerializer().Serialize(payload == null ? "" : payload) + "}");
+            }
+
+            /// <summary>按页面 Referer 下载图标并缩到 32×32 的 PNG data URL；失败返回空串（调用方退回原始 URL）。</summary>
+            private static string FetchIconData(string iconUrl, string pageUrl)
+            {
+                try
+                {
+                    if (string.IsNullOrEmpty(iconUrl)) return "";
+                    string referer = "";
+                    try
+                    {
+                        if (!string.IsNullOrEmpty(pageUrl))
+                        {
+                            Uri page = new Uri(pageUrl);
+                            referer = page.Scheme + "://" + page.Authority + "/";
+                        }
+                    }
+                    catch { }
+                    Program.LogResolve("icon fetch page=" + (string.IsNullOrEmpty(pageUrl) ? "(none)" : pageUrl)
+                        + " referer=" + (referer.Length > 0 ? referer : "(none)"));
+                    byte[] data = DownloadIcon(iconUrl, referer);
+                    // 少数站点反过来讨厌 Referer：带上失败就再裸试一次
+                    if (data == null || data.Length == 0) data = DownloadIcon(iconUrl, "");
+                    if (data == null || data.Length == 0)
+                    {
+                        Program.LogResolve("icon download empty");
+                        return "";
+                    }
+                    if (data.Length > 2 * 1024 * 1024)
+                    {
+                        Program.LogResolve("icon too big " + data.Length);
+                        return "";
+                    }
+                    using (MemoryStream source = new MemoryStream(data))
+                    using (Image image = Image.FromStream(source))
+                    using (Bitmap scaled = new Bitmap(32, 32))
+                    {
+                        using (Graphics g = Graphics.FromImage(scaled))
+                        {
+                            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                            g.DrawImage(image, 0, 0, 32, 32);
+                        }
+                        using (MemoryStream output = new MemoryStream())
+                        {
+                            scaled.Save(output, System.Drawing.Imaging.ImageFormat.Png);
+                            Program.LogResolve("icon got " + data.Length + " bytes -> png " + output.Length);
+                            return "data:image/png;base64," + Convert.ToBase64String(output.ToArray());
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Program.LogResolve("icon inline failed: " + ex.GetType().Name + " " + ex.Message);
+                    return "";
+                }
+            }
+
+            private static byte[] DownloadIcon(string iconUrl, string referer)
+            {
+                try
+                {
+                    // .NET Framework 默认可能只协商 TLS 1.0/1.1，现代 CDN 会握手失败（Tls11=768, Tls12=3072）
+                    try { System.Net.ServicePointManager.SecurityProtocol = (System.Net.SecurityProtocolType)(768 | 3072 | 192); }
+                    catch { }
+                    using (System.Net.WebClient client = new System.Net.WebClient())
+                    {
+                        client.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
+                        if (!string.IsNullOrEmpty(referer)) client.Headers.Add("Referer", referer);
+                        return client.DownloadData(iconUrl);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Program.LogResolve("icon download failed (referer=" + (string.IsNullOrEmpty(referer) ? "none" : "yes") + "): "
+                        + ex.GetType().Name + " " + ex.Message);
+                    return null;
+                }
+            }
+
+            /// <summary>ExecuteScriptAsync 的结果是 JSON 编码的，字符串值要脱掉外层引号。</summary>
+            private static string UnquoteJson(string raw)
+            {
+                if (string.IsNullOrEmpty(raw)) return "";
+                try
+                {
+                    object value = new JavaScriptSerializer().DeserializeObject(raw);
+                    return value == null ? "" : Convert.ToString(value);
+                }
+                catch { return ""; }
+            }
+
+            private void PostToPanel(string json)
+            {
+                try { if (web != null && web.CoreWebView2 != null) web.CoreWebView2.PostWebMessageAsJson(json); }
+                catch { }
+            }
+
+            private static bool AsBool(object value, bool fallback)
+            {
+                if (value == null) return fallback;
+                if (value is bool) return (bool)value;
+                try { return Convert.ToBoolean(value, System.Globalization.CultureInfo.InvariantCulture); }
+                catch { return fallback; }
+            }
+
             protected override void OnFormClosing(FormClosingEventArgs e)
             {
+                // 窗口关掉后遮罩的定时器还会 tick 到已释放的控件，先停掉
+                if (_embedMaskDelay != null) _embedMaskDelay.Stop();
+                if (_embedMaskClear != null) _embedMaskClear.Stop();
+                if (_embedMaskSpin != null) _embedMaskSpin.Stop();
                 // 2026-09-11：取消关闭询问弹窗，点 X 一律静默驻留托盘（引擎 3080 与 WiFi 反代 3081 继续跑），
                 // 双击托盘图标随时唤回；系统注销/关机（CloseReason 非 UserClosing）仍直接放行。
                 if (_closeResolved || e.CloseReason != CloseReason.UserClosing)
@@ -832,7 +2001,27 @@ namespace DshDesktop
 
                 try
                 {
-                    await web.EnsureCoreWebView2Async(null);
+                    // 主视图也开一个只绑本机的调试口（9222）：量 DSH 自己的界面尺寸用
+                    CoreWebView2EnvironmentOptions mainOptions = new CoreWebView2EnvironmentOptions
+                    {
+                        AdditionalBrowserArguments = "--remote-debugging-port=" + MainCdpPort
+                    };
+                    string mainData = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "dsh-desktop.exe.WebView2");
+                    CoreWebView2Environment mainEnv = await CoreWebView2Environment.CreateAsync(null, mainData, mainOptions);
+                    try
+                    {
+                        await _splash.EnsureCoreWebView2Async(mainEnv);
+                        _splash.CoreWebView2.Settings.IsStatusBarEnabled = false;
+                        _splash.CoreWebView2.WebMessageReceived += OnSplashMessage;
+                        _splash.CoreWebView2.SetVirtualHostNameToFolderMapping(SplashHost, SplashRoot(), CoreWebView2HostResourceAccessKind.Allow);
+                        _splash.CoreWebView2.Navigate("http://" + SplashHost + "/index.html");
+                    }
+                    catch (Exception exSplash)
+                    {
+                        System.Diagnostics.Debug.WriteLine("splash failed: " + exSplash.Message);
+                        HideSplash();
+                    }
+                    await web.EnsureCoreWebView2Async(mainEnv);
                 }
                 catch (Exception ex)
                 {
@@ -866,6 +2055,10 @@ namespace DshDesktop
                     if (wvArgs.PermissionKind == CoreWebView2PermissionKind.Notifications)
                         wvArgs.State = CoreWebView2PermissionState.Allow;
                 };
+                // 右栏内嵌浏览器：页面把面板矩形报过来（唯一通道，kind=dsh-embed 的消息才处理）
+                web.CoreWebView2.WebMessageReceived += OnWebMessage;
+                // 点主界面（离开内嵌视图或浮层）也把收藏夹浮层收起来
+                web.GotFocus += delegate { OnEmbedFocus(); };
 
                 bool broughtUpHere = false;
                 if (!Program.PortOpen())
