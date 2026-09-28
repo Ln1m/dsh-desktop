@@ -14,6 +14,8 @@ A Windows desktop shell and system-tray guard for DSH: two single-file C# progra
 | `apps/dsh-desktop/App.cs` | WebView2 window shell: hosts the DSH web UI in a native window, launches the engine, resolves the launch token, internalises the recharge / usage / API-key pages, confirms on close |
 | `dsh-tray/dsh-tray.cs` | System-tray guard: self-drawn dark menu, status light, start/stop for the 3080 engine and the 3081 phone reverse proxy, with "Quit DSH" as the only exit |
 
+Boot splash: [`dsh-boot-splash`](https://github.com/Ln1m/dsh-boot-splash) — a full-frame intro layer that plays while the window is up but the page has not painted yet (frosted-glass Skip pill, clip library).
+
 ## Layout convention
 
 Both programs build paths from the DSH install root (default `%USERPROFILE%\DeepSeek_harness`), overridable by environment variables:
