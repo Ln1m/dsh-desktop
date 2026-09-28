@@ -1,4 +1,4 @@
-# dsh-desktop
+﻿# dsh-desktop
 
 [English](README.en.md) · 中文
 
@@ -45,7 +45,7 @@ powershell -File .\dsh-tray\build.ps1
 
 ## 图标与品牌图
 
-窗口图标、托盘品牌图都不随仓库发布：放 `deepseek_harness.ico`、`deepseek-icon-64.png`、`changliao.ico` 到 `<DSH_ROOT>\assets\` 就会自动用上，取不到时程序退化绘制，不会报错。
+窗口图标由构建时的 `DSH_ICON` 指定；仓库 `assets/` 下带了一个自制的默认图标 `deepseek_harness.ico`（蓝底「DS」，非官方品牌图），不指定就不设图标。托盘品牌图从 `<DSH_ROOT>\assets\` 取，取不到就退化绘制。
 
 ## 前提
 

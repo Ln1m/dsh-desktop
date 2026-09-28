@@ -1,4 +1,4 @@
-# dsh-desktop
+﻿# dsh-desktop
 
 [中文](README.md) · English
 
@@ -45,7 +45,7 @@ powershell -File .\dsh-tray\build.ps1
 
 ## Icons and brand art
 
-The window icon and the tray brand image are not distributed with this repo: drop `deepseek_harness.ico`, `deepseek-icon-64.png` and `changliao.ico` into `<DSH_ROOT>\assets\` and they are picked up automatically. When they are missing the programs fall back to drawn placeholders instead of failing.
+The build takes the window icon from `DSH_ICON`; the repo ships a self-made default at `assets/deepseek_harness.ico` (a blue "DS" tile, not official brand art) — omit it and the shell simply has no window icon. The tray brand image is read from `<DSH_ROOT>\assets\` and falls back to a drawn placeholder.
 
 ## Requirements
 
