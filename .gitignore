@@ -1,9 +1,6 @@
-*.exe
+node_modules/
 *.log
 *.bak
 *.bak-*
-*.old-*
-build/packages/
-*.WebView2/
-obj/
-bin/
+.DS_Store
+Thumbs.db
