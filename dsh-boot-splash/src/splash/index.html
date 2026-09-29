@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>boot</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;background:#000;overflow:hidden}
+  video{display:block;width:100%;height:100%;object-fit:cover;background:#000}
+  #skip{
+    position:fixed;top:26px;right:34px;padding:10px 24px;border-radius:999px;
+    font:500 15px/1 "Microsoft YaHei UI","Segoe UI",sans-serif;letter-spacing:.18em;color:#fff;
+    background:rgba(255,255,255,.13);border:1px solid rgba(255,255,255,.24);
+    -webkit-backdrop-filter:blur(16px) saturate(180%);backdrop-filter:blur(16px) saturate(180%);
+    box-shadow:0 8px 26px rgba(0,0,0,.4);cursor:pointer;user-select:none;
+    opacity:0;transition:opacity .35s ease;pointer-events:none
+  }
+  #skip.on{opacity:1;pointer-events:auto}
+  #skip:hover{background:rgba(255,255,255,.22)}
+</style>
+</head>
+<body>
+<video id="v" muted playsinline></video>
+<div id="skip">跳过</div>
+<script>
+(function () {
+  var v = document.getElementById('v');
+  var skip = document.getElementById('skip');
+  var gap = 3000;
+  var hold = false;
+  var waitTimer = null;
+
+  function post(kind) {
+    try { window.chrome.webview.postMessage({ kind: kind }); } catch (e) {}
+  }
+  function play() {
+    try { var p = v.play(); if (p && p.catch) p.catch(function () {}); } catch (e) {}
+  }
+  function schedule() {
+    if (waitTimer) clearTimeout(waitTimer);
+    waitTimer = setTimeout(function () {
+      waitTimer = null;
+      if (hold) { post('splash-ended'); return; }
+      v.currentTime = 0;
+      play();
+    }, gap);
+  }
+
+  v.addEventListener('ended', function () {
+    if (hold) { post('splash-ended'); return; }
+    schedule();
+  });
+
+  skip.addEventListener('click', function () { post('splash-skip'); });
+
+  window.__splashReady = function () {
+    hold = true;
+    if (waitTimer) { clearTimeout(waitTimer); waitTimer = null; }
+    skip.classList.add('on');
+    if (v.ended || v.paused) { post('splash-ended'); }
+  };
+
+  fetch('config.json', { cache: 'no-store' })
+    .then(function (r) { return r.text(); })
+    .then(function (t) {
+      var c = {};
+      try { c = JSON.parse(t.replace(/^\uFEFF/, '')); } catch (e) { c = {}; }
+      if (c && typeof c.gapMs === 'number' && c.gapMs >= 0) { gap = c.gapMs; }
+      v.src = 'videos/' + ((c && c.video) || 'cyberpunk-intro.mp4');
+      play();
+    })
+    .catch(function () {
+      v.src = 'videos/cyberpunk-intro.mp4';
+      play();
+    });
+})();
+</script>
+</body>
+</html>
