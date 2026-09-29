@@ -14,7 +14,7 @@ DeepSeek Harness 的 Windows 桌面套壳和系统托盘守护，两个 C# 单�
 | `apps/dsh-desktop/App.cs` | WebView2 窗口套壳：把 DSH 的 web UI 装进原生窗口，拉引擎、解析启动 token、内化充值/用量/API Key 页面、关窗确认 |
 | `dsh-tray/dsh-tray.cs` | 系统托盘守护：自绘深色菜单、状态灯、启停 3080 引擎与 3081 手机反代，唯一退出入口「退出 DSH」 |
 
-启动片头：[`dsh-boot-splash`](https://github.com/Ln1m/dsh-boot-splash) —— 窗口刚起、页面还没渲染时铺满播放的开机动画层（毛玻璃「跳过」气泡 + 片库配置）。
+启动片头：[`dsh-boot-splash`](https://github.com/Ln1m/dsh-host-splash) —— 窗口刚起、页面还没渲染时铺满播放的开机动画层（毛玻璃「跳过」气泡 + 片库配置）。
 
 ## 目录约定
 
