@@ -1,5 +1,8 @@
 ﻿# dsh-desktop
 
+> **The vk build only**: position — not a plugin: the Windows desktop shell (WebView2) plus the system-tray guard; install the [dsh-vk-suite](https://github.com/Ln1m/dsh-vk-suite) contract + skeleton first.
+> Conflicts: a slot renders only its highest-priority entry, and two registrations at the same priority throw; mutually exclusive with anything claiming the same position (see "How to use it / what it conflicts with" in [dsh-vk-suite](https://github.com/Ln1m/dsh-vk-suite)).
+
 [中文](README.md) · English
 
 ![Desktop shell window](assets/dsh-desktop-window.png)
