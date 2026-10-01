@@ -46,6 +46,18 @@ namespace DshDesktop
         private const int ProxyPort = 3081;
         private static readonly string ProxyScript = Root + "\\scripts\\dsh-wifi-proxy.js";
         private const int SwRestore = 9;
+        // 2026-09-29：点 X 只隐藏窗口、外壳进程继续活着，于是需要一条能把隐藏窗口唤回来的路。
+        // .NET 的 Process.MainWindowHandle 只认可见窗口，窗口一藏它就返回 0，单实例激活失效 ——
+        // 改成广播一条自注册消息（RegisterWindowMessage），让还在跑的那个实例自己显形。
+        private const int HwndBroadcast = 0xFFFF;
+        private static readonly int ShowWindowMessage = RegisterWindowMessage("DshDesktop_ShowWindow_20260929");
+        private static readonly int ShowAckMessage = RegisterWindowMessage("DshDesktop_ShowWindowAck_20260929");
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern int RegisterWindowMessage(string lpString);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern bool PostMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
 
         [DllImport("user32.dll")]
         private static extern bool SetProcessDpiAwarenessContext(IntPtr value);
@@ -68,6 +80,56 @@ namespace DshDesktop
 
         [DllImport("dwmapi.dll")]
         private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+
+        // 最大化时按显示器工作区夹一次：去掉 WS_CAPTION 的窗口默认会铺满整块屏幕（把任务栏盖住）
+        private const int WM_GETMINMAXINFO = 0x0024;
+        private const int MONITOR_DEFAULTTONEAREST = 2;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct NPoint { public int x; public int y; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct NRect { public int left; public int top; public int right; public int bottom; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MinMaxInfo
+        {
+            public NPoint ptReserved;
+            public NPoint ptMaxSize;
+            public NPoint ptMaxPosition;
+            public NPoint ptMinTrackSize;
+            public NPoint ptMaxTrackSize;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MonitorInfo
+        {
+            public int cbSize;
+            public NRect rcMonitor;
+            public NRect rcWork;
+            public int dwFlags;
+        }
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr MonitorFromWindow(IntPtr hwnd, int flags);
+
+        [DllImport("user32.dll")]
+        private static extern bool GetMonitorInfo(IntPtr hMonitor, ref MonitorInfo lpmi);
+
+        private const int GWL_STYLE = -16;
+        private const int GWL_EXSTYLE = -20;
+
+        [DllImport("user32.dll")]
+        private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+
+        [DllImport("user32.dll")]
+        private static extern bool AdjustWindowRectEx(ref NRect lpRect, int dwStyle, bool bMenu, int dwExStyle);
+
+        [DllImport("user32.dll")]
+        private static extern bool AdjustWindowRectExForDpi(ref NRect lpRect, int dwStyle, bool bMenu, int dwExStyle, int dpi);
+
+        [DllImport("user32.dll")]
+        private static extern int GetDpiForWindow(IntPtr hwnd);
 
         [STAThread]
         private static int Main()
@@ -110,9 +172,53 @@ namespace DshDesktop
             return 0;
         }
 
+        /// <summary>
+        /// 只用来“回声”的隐藏窗口：第二实例广播唤回请求后，靠它确认在跑的那个实例真的答应了。
+        /// 不能靠 Process.MainWindowHandle 判断 —— 窗口驻留隐藏时它是 0（实测），隐藏窗口被 Show()
+        /// 唤回之后才重新有值，用它当判据会偶发地把“驻留中”误判成“没有实例”。
+        /// </summary>
+        private sealed class AckWindow : NativeWindow
+        {
+            public bool Got;
+
+            protected override void WndProc(ref Message m)
+            {
+                if (m.Msg == ShowAckMessage && m.WParam == Handle) Got = true;
+                base.WndProc(ref m);
+            }
+        }
+
+        private static AckWindow _ack;
+
+        /// <summary>把「显形」请求广播出去，等对面回声。返回 true = 另一个实例还活着并已答应。</summary>
+        private static bool PingResidentInstance()
+        {
+            try
+            {
+                if (_ack == null)
+                {
+                    _ack = new AckWindow();
+                    _ack.CreateHandle(new CreateParams());   // 隐藏的顶层窗口，够收广播
+                }
+                _ack.Got = false;
+                PostMessage(new IntPtr(HwndBroadcast), ShowWindowMessage, _ack.Handle, IntPtr.Zero);
+                for (int i = 0; i < 40 && !_ack.Got; i++)
+                {
+                    Application.DoEvents();
+                    Thread.Sleep(25);
+                }
+                return _ack.Got;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         /// <summary>Bring an already running instance to the foreground. Returns true when one was found.</summary>
         private static bool ActivateExistingInstance()
         {
+            bool found = false;
             try
             {
                 foreach (Process p in Process.GetProcessesByName("dsh-desktop"))
@@ -121,6 +227,7 @@ namespace DshDesktop
                     {
                         continue;
                     }
+                    found = true;
                     if (p.MainWindowHandle != IntPtr.Zero)
                     {
                         ShowWindowAsync(p.MainWindowHandle, SwRestore);
@@ -132,6 +239,8 @@ namespace DshDesktop
             catch
             {
             }
+            // 没有可见窗口 = 那个实例正驻留托盘，广播唤回并等它回声
+            if (found) return PingResidentInstance();
             return false;
         }
 
@@ -649,6 +758,42 @@ namespace DshDesktop
   }
 })();
 ");
+                        // 页面把当前深浅报给外壳：自绘标题栏与外框跟着主题走（写死深色的话，切浅色主题就是一块黑边）
+                        await web.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync(@"
+(function(){
+  var last = '';
+  function isDark(){
+    try {
+      var b = document.body;
+      if (!b) return true;
+      if (b.hasAttribute('data-ds-dark-theme')) return true;
+      if (b.hasAttribute('data-ds-light-theme')) return false;
+      return getComputedStyle(b).colorScheme === 'dark';
+    } catch (e) { return true; }
+  }
+  function report(){
+    try {
+      var dark = isDark();
+      var key = dark ? '1' : '0';
+      if (key === last) return;
+      last = key;
+      if (window.chrome && window.chrome.webview) window.chrome.webview.postMessage({ kind: 'dsh-shell-theme', dark: dark });
+    } catch (e) {}
+  }
+  function boot(){
+    report();
+    try {
+      new MutationObserver(report).observe(document.documentElement, {
+        attributes: true, subtree: true,
+        attributeFilter: ['class', 'data-ds-dark-theme', 'data-ds-light-theme']
+      });
+    } catch (e) {}
+    setInterval(report, 1500);
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+})();
+");
                         web.CoreWebView2.NewWindowRequested += (sender2, args2) =>
                         {
                             args2.Handled = true;
@@ -700,7 +845,8 @@ namespace DshDesktop
             private int _timeoutRetries;   // 被看门狗判定"超时未完成"的次数
             private System.Windows.Forms.Timer _navTimer;  // 导航看门狗
             private System.Windows.Forms.Timer _retryTimer; // 失败后退避重试
-            private Label _overlay;
+            private LoadingView _overlay;
+            private TitleBar _titleBar;
             // —— 开机片头（2026-09-28）：铺满窗口，盖住"WebView2 还没渲染出 DSH 界面"的那段空白 ——
             private static readonly string SplashTemplate = Root + @"\\assets\boot-splash";
             private const string SplashHost = "splash.local";
@@ -725,6 +871,10 @@ namespace DshDesktop
                 public string Url = "";
                 public string Title = "";
                 public bool Loading;
+                /// <summary>当前显示的是外壳那张深色失败页（地址栏与标题不能被它覆盖）。</summary>
+                public bool Failed;
+                /// <summary>这一页已经做过「适合宽度」判断（每页只自动调一次，避免和用户抢缩放）。</summary>
+                public bool Fitted;
             }
             /// <summary>加载遮罩：导航期间盖住旧页面（WebView2 默认会一直显示旧页直到新页首帧，
             /// 面板那边看不到任何动静，观感就是"点了没反应"）。</summary>
@@ -742,7 +892,7 @@ namespace DshDesktop
                 protected override void OnPaint(PaintEventArgs e)
                 {
                     Graphics g = e.Graphics;
-                    using (SolidBrush back = new SolidBrush(Color.FromArgb(0x17, 0x18, 0x1C)))
+                    using (SolidBrush back = new SolidBrush(Color.FromArgb(0x15, 0x15, 0x17)))
                     {
                         g.FillRectangle(back, ClientRectangle);
                     }
@@ -771,6 +921,345 @@ namespace DshDesktop
                 }
             }
 
+            /// <summary>启动/重连遮罩：深色底 + 居中状态文字 + 一条来回扫动的细进度线；只在可见时跑定时器。</summary>
+            private sealed class LoadingView : Control
+            {
+                private readonly Font _fTitle = new Font("Microsoft YaHei UI", 13f, FontStyle.Regular);
+                private readonly Font _fDetail = new Font("Microsoft YaHei UI", 10f, FontStyle.Regular);
+                private readonly System.Windows.Forms.Timer _anim;
+                private double _phase;
+                private double _fade;
+                private string _title = "正在连接 DSH";
+                private string _detail = "";
+
+                public LoadingView()
+                {
+                    SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint
+                        | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+                    // _anim 必须先建好：下面这行 SetVisibleCore 会立刻回调 OnVisibleChanged，那里要 _anim.Stop()
+                    _anim = new System.Windows.Forms.Timer { Interval = 40 };
+                    _anim.Tick += delegate(object s, EventArgs e) { Step(); };
+                    Visible = false;
+                }
+
+                /// <summary>换一条状态并淡入显示。</summary>
+                public void ShowState(string title, string detail)
+                {
+                    _title = title ?? "";
+                    _detail = detail ?? "";
+                    _fade = 0;
+                    Visible = true;
+                    BringToFront();
+                    _anim.Start();
+                    Invalidate();
+                }
+
+                protected override void OnVisibleChanged(EventArgs e)
+                {
+                    base.OnVisibleChanged(e);
+                    if (Visible)
+                    {
+                        _fade = 0;
+                        _anim.Start();
+                    }
+                    else
+                    {
+                        _anim.Stop();
+                    }
+                }
+
+                private void Step()
+                {
+                    _phase += 0.022;
+                    if (_phase >= 1.0) _phase -= 1.0;
+                    if (_fade < 1.0) _fade = Math.Min(1.0, _fade + 0.11);
+                    Invalidate();
+                }
+
+                protected override void Dispose(bool disposing)
+                {
+                    if (disposing)
+                    {
+                        _anim.Stop();
+                        _anim.Dispose();
+                        _fTitle.Dispose();
+                        _fDetail.Dispose();
+                    }
+                    base.Dispose(disposing);
+                }
+
+                protected override void OnPaint(PaintEventArgs e)
+                {
+                    Graphics g = e.Graphics;
+                    using (SolidBrush back = new SolidBrush(Color.FromArgb(0x15, 0x15, 0x17)))
+                    {
+                        g.FillRectangle(back, ClientRectangle);
+                    }
+                    int cx = Width / 2;
+                    int cy = Height / 2;
+                    if (cx < 60 || cy < 60) return;
+                    float s = g.DpiX / 96f;
+                    if (s <= 0f) s = 1f;
+                    int a = (int)(255 * _fade);
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+                    using (StringFormat sf = new StringFormat())
+                    {
+                        sf.Alignment = StringAlignment.Center;
+                        sf.LineAlignment = StringAlignment.Center;
+                        using (SolidBrush b = new SolidBrush(Color.FromArgb(a, 0xE6, 0xE9, 0xEF)))
+                        {
+                            g.DrawString(_title, _fTitle, b, new RectangleF(0f, cy - 30f * s, Width, 30f * s), sf);
+                        }
+                        if (_detail.Length > 0)
+                        {
+                            using (SolidBrush b = new SolidBrush(Color.FromArgb((int)(a * 0.72), 0x8A, 0x92, 0xA0)))
+                            {
+                                g.DrawString(_detail, _fDetail, b, new RectangleF(0f, cy + 2f * s, Width, 22f * s), sf);
+                            }
+                        }
+                    }
+                    int barW = (int)(210f * s);
+                    int barH = Math.Max(2, (int)(3f * s));
+                    int barX = cx - barW / 2;
+                    int barY = cy + (int)(34f * s);
+                    Rectangle track = new Rectangle(barX, barY, barW, barH);
+                    using (GraphicsPath p = DialogUi.Round(track, barH))
+                    using (SolidBrush b = new SolidBrush(Color.FromArgb((int)(a * 0.85), 0x26, 0x2A, 0x32)))
+                    {
+                        g.FillPath(b, p);
+                    }
+                    int fgW = (int)(barW * 0.34f);
+                    double t = 0.5 - 0.5 * Math.Cos(2.0 * Math.PI * _phase);
+                    Rectangle head = new Rectangle(barX + (int)((barW - fgW) * t), barY, fgW, barH);
+                    using (GraphicsPath p = DialogUi.Round(head, barH))
+                    using (LinearGradientBrush lg = new LinearGradientBrush(head,
+                        Color.FromArgb((int)(a * 0.55), 0x3F, 0x6B, 0xC8), Color.FromArgb(a, 0x6F, 0xA8, 0xFF),
+                        LinearGradientMode.Horizontal))
+                    {
+                        g.FillPath(lg, p);
+                    }
+                }
+            }
+
+            /// <summary>自绘标题栏：左侧应用图标 + 右侧最小化/最大化/关闭；空白处按下交给系统的 HTCAPTION 拖动（双击最大化与贴边 Snap 跟着系统走）。</summary>
+            private sealed class TitleBar : Control
+            {
+                private const int WM_NCLBUTTONDOWN = 0x00A1;
+                private const int HTCAPTION = 2;
+                private int _hot = -1;
+                private int _down = -1;
+                private float _scale = 1f;
+                private Image _icon;
+                private bool _dark = true;
+                private Color _glyph = Color.FromArgb(0x99, 0x9F, 0xA9);
+                private Color _glyphHot = Color.FromArgb(0xE6, 0xE9, 0xEF);
+                private Color _hoverFill = Color.FromArgb(0x18, 0xFF, 0xFF, 0xFF);
+
+                /// <summary>页面切浅色时头部跟着换：底色、字形色、悬停底色成对换，别留一块深色孤岛。</summary>
+                public void SetTheme(Color back, bool dark)
+                {
+                    BackColor = back;
+                    _dark = dark;
+                    _glyph = dark ? Color.FromArgb(0x99, 0x9F, 0xA9) : Color.FromArgb(0x6B, 0x72, 0x80);
+                    _glyphHot = dark ? Color.FromArgb(0xE6, 0xE9, 0xEF) : Color.FromArgb(0x1F, 0x23, 0x28);
+                    _hoverFill = dark ? Color.FromArgb(0x18, 0xFF, 0xFF, 0xFF) : Color.FromArgb(0x14, 0x00, 0x00, 0x00);
+                    Invalidate();
+                }
+
+                public TitleBar()
+                {
+                    SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint
+                        | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+                    BackColor = Color.FromArgb(0x15, 0x15, 0x17);
+                    _icon = LoadIconImage(IconPath, 32);
+                    if (_icon == null)
+                    {
+                        try { _icon = new Icon(IconPath, 32, 32).ToBitmap(); }
+                        catch { }
+                    }
+                }
+
+                /// <summary>这个 .ico 的每一帧都是 PNG 压缩的：System.Drawing.Icon 会把帧数据当 DIB 解，
+                /// 画出来是一片彩色雪花。这里按 ICO 目录表挑最接近目标尺寸的一帧，PNG 帧交回 GDI+ 解。</summary>
+                public static Image LoadIconImage(string path, int want)
+                {
+                    try
+                    {
+                        byte[] all = File.ReadAllBytes(path);
+                        if (all.Length < 6) return null;
+                        int frames = BitConverter.ToInt16(all, 4);
+                        int bestOff = -1;
+                        int bestSize = 0;
+                        int bestDiff = int.MaxValue;
+                        for (int i = 0; i < frames; i++)
+                        {
+                            int o = 6 + i * 16;
+                            if (o + 16 > all.Length) break;
+                            int w = all[o];
+                            if (w == 0) w = 256;
+                            int size = BitConverter.ToInt32(all, o + 8);
+                            int off = BitConverter.ToInt32(all, o + 12);
+                            if (size <= 0 || off <= 0 || off + size > all.Length) continue;
+                            int diff = Math.Abs(w - want);
+                            if (diff >= bestDiff) continue;
+                            bestDiff = diff;
+                            bestOff = off;
+                            bestSize = size;
+                        }
+                        if (bestOff < 0) return null;
+                        using (MemoryStream ms = new MemoryStream(all, bestOff, bestSize))
+                        using (Image raw = Image.FromStream(ms))
+                        {
+                            // FromStream 的图绑在这条流上，拷一份出来再让流走
+                            Bitmap copy = new Bitmap(raw.Width, raw.Height, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+                            using (Graphics g = Graphics.FromImage(copy)) g.DrawImageUnscaled(raw, 0, 0);
+                            return copy;
+                        }
+                    }
+                    catch { return null; }
+                }
+
+                public static int ScaledHeight(float dpi)
+                {
+                    return (int)Math.Round(38f * (dpi / 96f));
+                }
+
+                private Rectangle BtnRect(int i, float s)
+                {
+                    int w = (int)Math.Round(46f * s);
+                    return new Rectangle(Width - (3 - i) * w, 0, w, Height);
+                }
+
+                private int Hit(int x, int y)
+                {
+                    for (int i = 0; i < 3; i++) if (BtnRect(i, _scale).Contains(x, y)) return i;
+                    return -1;
+                }
+
+                protected override void Dispose(bool disposing)
+                {
+                    if (disposing && _icon != null) { _icon.Dispose(); _icon = null; }
+                    base.Dispose(disposing);
+                }
+
+                protected override void OnMouseMove(MouseEventArgs e)
+                {
+                    base.OnMouseMove(e);
+                    int h = (_down >= 0) ? _down : Hit(e.X, e.Y);
+                    if (h != _hot) { _hot = h; Invalidate(); }
+                }
+
+                protected override void OnMouseLeave(EventArgs e)
+                {
+                    base.OnMouseLeave(e);
+                    if (_hot != -1) { _hot = -1; Invalidate(); }
+                }
+
+                protected override void OnMouseDown(MouseEventArgs e)
+                {
+                    base.OnMouseDown(e);
+                    if (e.Button != MouseButtons.Left) return;
+                    int h = Hit(e.X, e.Y);
+                    if (h >= 0) { _down = h; _hot = h; Invalidate(); return; }
+                    try
+                    {
+                        Form f = FindForm();
+                        if (f == null) return;
+                        ReleaseCapture();
+                        SendMessage(f.Handle, WM_NCLBUTTONDOWN, (IntPtr)HTCAPTION, IntPtr.Zero);
+                    }
+                    catch
+                    {
+                    }
+                }
+
+                protected override void OnMouseUp(MouseEventArgs e)
+                {
+                    base.OnMouseUp(e);
+                    if (_down < 0) return;
+                    int act = (Hit(e.X, e.Y) == _down) ? _down : -1;
+                    _down = -1;
+                    _hot = -1;
+                    Invalidate();
+                    Form f = FindForm();
+                    if (f == null || act < 0) return;
+                    if (act == 0) f.WindowState = FormWindowState.Minimized;
+                    else if (act == 1) f.WindowState = (f.WindowState == FormWindowState.Maximized)
+                        ? FormWindowState.Normal : FormWindowState.Maximized;
+                    else if (act == 2) f.Close();
+                }
+
+                protected override void OnPaint(PaintEventArgs e)
+                {
+                    Graphics g = e.Graphics;
+                    float s = g.DpiX / 96f;
+                    if (s <= 0f) s = 1f;
+                    _scale = s;
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    using (SolidBrush back = new SolidBrush(BackColor))
+                    {
+                        g.FillRectangle(back, ClientRectangle);
+                    }
+                    if (_icon != null)
+                    {
+                        int isz = (int)Math.Round(16f * s);
+                        g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                        g.DrawImage(_icon, new Rectangle((int)Math.Round(14f * s), (Height - isz) / 2, isz, isz));
+                    }
+                    bool maxed = (FindForm() != null && FindForm().WindowState == FormWindowState.Maximized);
+                    for (int i = 0; i < 3; i++)
+                    {
+                        Rectangle r = BtnRect(i, s);
+                        bool hot = (_hot == i);
+                        if (i == 2 && hot)
+                        {
+                            using (SolidBrush b = new SolidBrush(Color.FromArgb(0xC4, 0x2B, 0x1C))) g.FillRectangle(b, r);
+                        }
+                        else if (hot)
+                        {
+                            using (SolidBrush b = new SolidBrush(_hoverFill)) g.FillRectangle(b, r);
+                        }
+                        Color fg = (i == 2 && hot) ? Color.White : (hot ? _glyphHot : _glyph);
+                        float cx = r.X + r.Width / 2f;
+                        float cy = r.Y + r.Height / 2f;
+                        float u = 5f * s;
+                        using (Pen p = new Pen(fg, Math.Max(1f, 1.1f * s)))
+                        {
+                            p.StartCap = LineCap.Round;
+                            p.EndCap = LineCap.Round;
+                            if (i == 0)
+                            {
+                                g.DrawLine(p, cx - u, cy, cx + u, cy);
+                            }
+                            else if (i == 1)
+                            {
+                                if (maxed)
+                                {
+                                    float w = u * 1.7f;
+                                    float bx = cx - u + 1.6f * s;
+                                    float by = cy - u;
+                                    float fx = cx - u;
+                                    float fy = cy - u + 1.6f * s;
+                                    g.DrawLine(p, bx, by, bx + w, by);
+                                    g.DrawLine(p, bx + w, by, bx + w, by + w);
+                                    g.DrawRectangle(p, fx, fy, w, w);
+                                }
+                                else
+                                {
+                                    g.DrawRectangle(p, cx - u, cy - u, u * 2f, u * 2f);
+                                }
+                            }
+                            else
+                            {
+                                g.DrawLine(p, cx - u, cy - u, cx + u, cy + u);
+                                g.DrawLine(p, cx - u, cy + u, cx + u, cy - u);
+                            }
+                        }
+                    }
+                }
+            }
+
             private EmbedMask _embedMask;
             /// <summary>延迟露面（180ms）：几百毫秒内就完成的导航不闪遮罩。</summary>
             private System.Windows.Forms.Timer _embedMaskDelay;
@@ -786,18 +1275,130 @@ namespace DshDesktop
             private int _embedSerial = 0;
             /// <summary>当前面板矩形（新标签挂上来就照它摆位）。</summary>
             private Rectangle _embedBounds = Rectangle.Empty;
+            /// <summary>热路径共用一个序列化器：每条 WebMessage 都 new 一个 JavaScriptSerializer 是白扔掉的开销。</summary>
+            private static readonly JavaScriptSerializer EmbedJson = new JavaScriptSerializer();
             /// <summary>标签数上限，到顶就不再开新的。</summary>
             private const int EmbedTabMax = 8;
             /// <summary>内嵌浏览器自己的 CDP 调试端口（只绑 127.0.0.1）：agent 驱动的是同一块视图，动作直接显示在面板里。</summary>
             private const string EmbedCdpPort = "9223";
+            /// <summary>内嵌浏览器进程的启动参数：调试口 + 细滚动条（经典滚动条在窄栏里占宽又扎眼）。</summary>
+            private const string EmbedBrowserArgs = "--remote-debugging-port=" + EmbedCdpPort
+                + " --remote-allow-origins=* --enable-features=OverlayScrollbar";
             /// <summary>主视图（DSH 界面本身）的 CDP 端口（只绑 127.0.0.1）：界面问题直接量 DOM 尺寸，不靠截图猜。</summary>
             private const string MainCdpPort = "9222";
+            /// <summary>把页面当前的深浅报给外壳：自绘标题栏与外框跟着主题走。
+            /// 注意 AddScriptToExecuteOnDocumentCreatedAsync 只对"之后创建"的文档生效，
+            /// 主视图那份文档早就建好了，必须再 ExecuteScriptAsync 跑一次（踩过：只挂注入，主题永远不生效）。</summary>
+            private const string ShellThemeScript = @"(function(){
+  var last = '';
+  function isDark(){
+    try {
+      var b = document.body;
+      if (!b) return true;
+      if (b.hasAttribute('data-ds-dark-theme')) return true;
+      if (b.hasAttribute('data-ds-light-theme')) return false;
+      return getComputedStyle(b).colorScheme === 'dark';
+    } catch (e) { return true; }
+  }
+  function report(){
+    try {
+      var dark = isDark();
+      var key = dark ? '1' : '0';
+      if (key === last) return;
+      last = key;
+      if (window.chrome && window.chrome.webview) window.chrome.webview.postMessage({ kind: 'dsh-shell-theme', dark: dark });
+    } catch (e) {}
+  }
+  function boot(){
+    report();
+    try {
+      new MutationObserver(report).observe(document.documentElement, {
+        attributes: true, subtree: true,
+        attributeFilter: ['class', 'data-ds-dark-theme', 'data-ds-light-theme']
+      });
+    } catch (e) {}
+    setInterval(report, 1500);
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+})();";
             /// <summary>内嵌视图缩放：右栏窄，缩一点才放得下必应那种 768 死版心的首页，观感也更像桌面浏览器。</summary>
             private const double EmbedZoom = 0.8;
             /// <summary>导航栏「首页」按钮的去处（与前端起始页一致）。</summary>
             private const string EmbedHome = "https://limestart.cn/";
             /// <summary>缩放 ± 的步长。</summary>
             private const double EmbedZoomStep = 0.1;
+            /// <summary>用户手动调过的缩放（0 = 没调过，新标签按面板宽度取默认值）。</summary>
+            private double _embedZoomUser;
+            /// <summary>内嵌浏览器下载落盘目录：跟着安装盘走（装在 D 盘就落在 D 盘的 Downloads 目录），
+            /// 装到别的盘就回退到系统下载文件夹——不写死盘符，换机器一样能用。</summary>
+            private static string DownloadDir
+            {
+                get
+                {
+                    try
+                    {
+                        string root = Path.GetPathRoot(AppDomain.CurrentDomain.BaseDirectory);
+                        if (!string.IsNullOrEmpty(root)) return Path.Combine(root, "Downloads");
+                    }
+                    catch
+                    {
+                    }
+                    try
+                    {
+                        return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
+                    }
+                    catch
+                    {
+                    }
+                    return "Downloads";
+                }
+            }
+            /// <summary>面板里那条下载条的数据源：保留最近几条，完成/失败都留着，由用户自己清掉。</summary>
+            private sealed class EmbedDownload
+            {
+                public string Id;
+                public string Name = "";
+                public long Received;
+                public long Total;
+                public string State = "run";
+                public string Reason = "";
+                public string Path = "";
+                public CoreWebView2DownloadOperation Op;
+                public DateTime Pushed = DateTime.MinValue;
+            }
+            private readonly List<EmbedDownload> _downloads = new List<EmbedDownload>();
+            private int _downloadSerial;
+            /// <summary>内嵌视图的底色：页面前一帧、后台标签换页时露出的就是它，不设是白的。</summary>
+            private static readonly Color EmbedBack = Color.FromArgb(0x15, 0x15, 0x17);
+            /// <summary>WebView2 的 WinForms 控件不把键事件交给宿主，快捷键只能在页面里拦（Ctrl+T/W/L/Tab/1-8）。</summary>
+            private const string EmbedKeyScript = @"(function(){
+  if (window.__dshEmbedKeys) return; window.__dshEmbedKeys = 1;
+  window.addEventListener('keydown', function(e){
+    if (!e.ctrlKey || e.altKey || e.metaKey) return;
+    var k = (e.key || '').toLowerCase();
+    if (k !== 't' && k !== 'w' && k !== 'l' && k !== 'tab' && !(k >= '1' && k <= '8')) return;
+    e.preventDefault(); e.stopPropagation();
+    try { chrome.webview.postMessage({ kind: 'dsh-embed-key', key: k, shift: e.shiftKey === true }); } catch (err) {}
+  }, true);
+})();";
+            /// <summary>打不开页面时顶掉 Chromium 那张浅色错误页；__REASON__ / __URL__ 由 EmbedErrorHtml 填。</summary>
+            private const string EmbedErrorTemplate = @"<!doctype html><html><head><meta charset='utf-8'><style>
+html,body{margin:0;padding:0;height:100%;background:#151517;color:#c6cad3;font:14px/1.6 'Microsoft YaHei UI','Segoe UI',sans-serif;-webkit-user-select:none}
+body{display:flex;align-items:center;justify-content:center}
+.card{display:flex;flex-direction:column;align-items:center;gap:9px;max-width:80%;text-align:center}
+svg{color:#5b616b}
+.t{font-size:15px;color:#e6e9ef}
+.r{font-size:13px;color:#8b919b}
+.u{font-size:12px;color:#6f757e;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+button{margin-top:8px;height:30px;padding:0 18px;border:0;border-radius:6px;background:#3b6ef0;color:#fff;font-size:13px;cursor:pointer}
+button:hover{background:#4a7cf5}
+</style></head><body><div class='card'>
+<svg width='34' height='34' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.6' stroke-linecap='round'><circle cx='12' cy='12' r='9'/><path d='M5.5 5.5l13 13'/></svg>
+<div class='t'>打不开这个页面</div><div class='r'>__REASON__</div><div class='u'>__URL__</div>
+<button id='retry'>重试</button></div><script>
+document.getElementById('retry').onclick=function(){try{chrome.webview.postMessage({retry:true});}catch(e){}};
+</script></body></html>";
             // —— 收藏夹浮层（2026-09-28）：一块独立的小 WebView2，叠在内嵌视图之上 ——
             // 内嵌视图是原生子控件，永远盖在页面 DOM 之上，所以收藏夹只有两条路：让画面让位（整页感），
             // 或者自己也是一块原生控件压在画面上。这里走后者：浮层自带深色页面，画面不再隐藏。
@@ -857,7 +1458,7 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                 Text = "DeepSeek Harness";
                 AutoScaleMode = AutoScaleMode.None;
                 // 浮层控件透明区透出来的就是这个颜色：深色才像卡片阴影，系统默认浅灰会是一圈发灰的边
-                BackColor = Color.FromArgb(0x18, 0x19, 0x1D);
+                BackColor = Color.FromArgb(0x15, 0x15, 0x17);
                 // Default window: 75% of the working-area width, 16:9 aspect ratio,
                 // centered on the primary screen (physical pixels, PMv2-aware).
                 Rectangle wa = Screen.PrimaryScreen.WorkingArea;
@@ -881,23 +1482,22 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                 StartPosition = FormStartPosition.CenterScreen;
                 try
                 {
-                    Icon = new Icon(IconPath);
+                    // 同一个坑：这个 .ico 是 PNG 帧，Icon 直接读会拿到雪花，任务栏/Alt-Tab 就是花方块
+                    Image mark = TitleBar.LoadIconImage(IconPath, 32);
+                    if (mark == null) Icon = new Icon(IconPath);
+                    else Icon = Icon.FromHandle(((Bitmap)mark).GetHicon());
                 }
                 catch
                 {
                 }
                 web = new WebView2();
                 web.Dock = DockStyle.Fill;
+                try { web.DefaultBackgroundColor = Color.FromArgb(0x15, 0x15, 0x17); } catch { }
                 Controls.Add(web);
                 // 加载遮罩：盖在 WebView2 之上；加载成功即隐藏，因此不会挡住页面。
                 // （黑屏那次就是这个状态一直挂着不消失——因为没有任何重试逻辑）
-                _overlay = new Label();
+                _overlay = new LoadingView();
                 _overlay.Dock = DockStyle.Fill;
-                _overlay.BackColor = Color.FromArgb(24, 24, 28);
-                _overlay.ForeColor = Color.FromArgb(214, 218, 226);
-                _overlay.TextAlign = ContentAlignment.MiddleCenter;
-                _overlay.Font = new Font("Microsoft YaHei UI", 10f);
-                _overlay.Text = "正在连接 DSH 服务…";
                 _overlay.Visible = false;
                 Controls.Add(_overlay);
                 // 开机片头盖在最上层：窗口一出现就有画面，直到 DSH 界面自己渲染出来
@@ -908,7 +1508,107 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                 try { _splash.DefaultBackgroundColor = Color.Black; } catch { }
                 Controls.Add(_splash);
                 _splash.BringToFront();
+                _titleBar = new TitleBar();
+                _titleBar.Location = new Point(0, 0);
+                _titleBar.Height = TitleBar.ScaledHeight(96f);
+                _titleBar.Width = Math.Max(200, ClientSize.Width);
+                Controls.Add(_titleBar);
+                _titleBar.BringToFront();
+                Padding = new Padding(0, _titleBar.Height, 0, 0);
                 Shown += OnShown;
+            }
+
+            /// <summary>自绘标题栏：去掉系统标题栏（WS_CAPTION），保留缩放边框（WS_THICKFRAME）——缩放、贴边 Snap、阴影、圆角仍由系统提供。</summary>
+            protected override CreateParams CreateParams
+            {
+                get
+                {
+                    CreateParams cp = base.CreateParams;
+                    cp.Style |= 0x00040000;
+                    cp.Style &= ~0x00C00000;
+                    return cp;
+                }
+            }
+
+            protected override void OnResize(EventArgs e)
+            {
+                base.OnResize(e);
+                if (_titleBar != null) _titleBar.Width = Math.Max(200, ClientSize.Width);
+            }
+
+            // —— Win11 窗口外观（2026-09-30）：标题栏与内容同色、细描边；旧系统不认这几项，调用失败即忽略 ——
+            private const int DwmUseImmersiveDarkMode = 20;
+            private const int DwmWindowCornerPreference = 33;
+            private const int DwmBorderColor = 34;
+            private const int DwmCaptionColor = 35;
+            private const int DwmTextColor = 36;
+
+            private static int DwmColor(int r, int g, int b)
+            {
+                return (b << 16) | (g << 8) | r;
+            }
+
+            private static void TryDwm(IntPtr hwnd, int attr, int value)
+            {
+                try
+                {
+                    int v = value;
+                    DwmSetWindowAttribute(hwnd, attr, ref v, 4);
+                }
+                catch
+                {
+                }
+            }
+
+            private void ApplyWindowChrome()
+            {
+                if (!IsHandleCreated) return;
+                if (_titleBar != null)
+                {
+                    float dpi = 96f;
+                    try { using (Graphics g = CreateGraphics()) dpi = g.DpiX; } catch { }
+                    int hgt = TitleBar.ScaledHeight(dpi);
+                    if (_titleBar.Height != hgt)
+                    {
+                        _titleBar.Height = hgt;
+                        Padding = new Padding(0, hgt, 0, 0);
+                    }
+                    _titleBar.Width = Math.Max(200, ClientSize.Width);
+                }
+                IntPtr h = Handle;
+                TryDwm(h, DwmUseImmersiveDarkMode, _shellDark ? 1 : 0);
+                TryDwm(h, DwmCaptionColor, _shellDark ? DwmColor(0x15, 0x15, 0x17) : DwmColor(0xF3, 0xF4, 0xF6));
+                TryDwm(h, DwmTextColor, _shellDark ? DwmColor(0xD8, 0xDC, 0xE4) : DwmColor(0x1F, 0x23, 0x28));
+                TryDwm(h, DwmBorderColor, _shellDark ? DwmColor(0x2A, 0x2E, 0x36) : DwmColor(0xD8, 0xDC, 0xE0));
+                TryDwm(h, DwmWindowCornerPreference, 2);
+            }
+
+            /// <summary>页面是不是深色。外壳头部与外框跟着它换，不再写死深色。</summary>
+            private bool _shellDark = true;
+
+            private void ApplyShellTheme(bool dark)
+            {
+                _shellDark = dark;
+                Color back = dark ? Color.FromArgb(0x15, 0x15, 0x17) : Color.FromArgb(0xF3, 0xF4, 0xF6);
+                BackColor = back;
+                if (_titleBar != null) _titleBar.SetTheme(back, dark);
+                if (!IsHandleCreated) return;
+                ApplyWindowChrome();
+                try { if (web != null) web.DefaultBackgroundColor = back; }
+                catch { }
+                Program.LogResolve("shell theme dark=" + (dark ? "1" : "0"));
+            }
+
+            protected override void OnHandleCreated(EventArgs e)
+            {
+                base.OnHandleCreated(e);
+                ApplyWindowChrome();
+            }
+
+            protected override void OnDpiChanged(DpiChangedEventArgs e)
+            {
+                base.OnDpiChanged(e);
+                ApplyWindowChrome();
             }
 
             /// <summary>开始一次导航：先武装看门狗，再导航（顺序不能反，否则可能漏掉即时的 NavigationCompleted）。</summary>
@@ -935,7 +1635,7 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                         if (_overlay != null)
                         {
                             _overlay.Visible = true;
-                            _overlay.Text = "正在连接 DSH 服务…" + Environment.NewLine + reason;
+                            _overlay.ShowState("正在连接 DSH", reason);
                         }
                     }
                     // 主页面要重载了：先把内嵌浏览器收掉，别让它盖住加载遮罩（页面回来后客户端会重新报矩形）
@@ -960,7 +1660,7 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                 if (_overlay != null)
                 {
                     _overlay.Visible = true;
-                    _overlay.Text = "后端还没就绪，正在重试…";
+                    _overlay.ShowState("还没连上 DSH", "正在重试");
                 }
                 ScheduleRetry();
             }
@@ -980,7 +1680,7 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                 if (_overlay != null)
                 {
                     _overlay.Visible = true;
-                    _overlay.Text = "页面加载失败，正在重试…";
+                    _overlay.ShowState("页面加载失败", "正在重试");
                 }
                 ScheduleRetry();
             }
@@ -1131,11 +1831,15 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                 {
                     return Rectangle.Empty;
                 }
-                Rectangle client = ClientRectangle;
-                if (cx < 0) cx = 0;
-                if (cy < 0) cy = 0;
-                if (cx + cw > client.Width) cw = client.Width - cx;
-                if (cy + ch > client.Height) ch = client.Height - cy;
+                // 页面视口原点 = 主 WebView2 的左上角；它不在客户区原点（顶部让给了自绘标题栏）时要跟着偏移
+                Point origin = web.Location;
+                cx += origin.X;
+                cy += origin.Y;
+                Rectangle client = new Rectangle(origin, web.ClientSize);
+                if (cx < client.Left) cx = client.Left;
+                if (cy < client.Top) cy = client.Top;
+                if (cx + cw > client.Right) cw = client.Right - cx;
+                if (cy + ch > client.Bottom) ch = client.Bottom - cy;
                 if (cw < 40 || ch < 40)
                 {
                     return Rectangle.Empty;
@@ -1162,9 +1866,23 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                 string json;
                 try { json = e.WebMessageAsJson; }
                 catch { return; }
-                if (string.IsNullOrEmpty(json) || json.IndexOf("dsh-embed", StringComparison.Ordinal) < 0) return;
+                if (string.IsNullOrEmpty(json)) return;
+                // 页面报深浅：主界面自己的消息，跟嵌入浏览器那条通道无关
+                if (json.IndexOf("dsh-shell-theme", StringComparison.Ordinal) >= 0)
+                {
+                    bool dark = true;
+                    try
+                    {
+                        Dictionary<string, object> themeMsg = EmbedJson.Deserialize<Dictionary<string, object>>(json);
+                        if (themeMsg != null && themeMsg.ContainsKey("dark")) dark = AsBool(themeMsg["dark"], true);
+                    }
+                    catch { }
+                    ApplyShellTheme(dark);
+                    return;
+                }
+                if (json.IndexOf("dsh-embed", StringComparison.Ordinal) < 0) return;
                 Dictionary<string, object> msg;
-                try { msg = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(json); }
+                try { msg = EmbedJson.Deserialize<Dictionary<string, object>>(json); }
                 catch { return; }
                 if (msg == null || !msg.ContainsKey("kind") || Convert.ToString(msg["kind"]) != "dsh-embed") return;
                 string cmd = msg.ContainsKey("cmd") ? Convert.ToString(msg["cmd"]) : "";
@@ -1175,6 +1893,12 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                     return;
                 }
                 Rectangle rect = EmbedRect(msg);
+                // 下载条上的动作与内嵌视图的显示状态无关：先处理
+                if (cmd == "download")
+                {
+                    EmbedDownloadAction(msg);
+                    return;
+                }
                 // 收藏夹浮层与内嵌视图的显示状态无关：先处理，别碰 _embedWanted
                 if (cmd == "shelf")
                 {
@@ -1217,13 +1941,32 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                 }
                 if (cmd == "rect" && _embed != null && !rect.IsEmpty)
                 {
-                    _embedBounds = rect;
-                    _embed.Bounds = rect;
-                    if (!_embed.Visible && !_embedMaskOn) _embed.Visible = true;
-                    _embed.BringToFront();
-                    SyncEmbedMask();
-                    BringShelfFront();
+                    ApplyEmbedBounds(rect);
                 }
+            }
+
+            /// <summary>把面板报来的矩形落到原生控件上：矩形没变就不碰它（不重排、不刷新），
+            /// 只有「刚从隐藏变可见」才抬一次 z 序（每条消息都抬是卡顿主因）。
+            /// 这里**不合并、不延迟**：右栏展开/收起/全屏都是带动画的，晚一拍就是「画面跟不上右栏」。</summary>
+            private void ApplyEmbedBounds(Rectangle rect)
+            {
+                if (_embed == null || rect.IsEmpty) return;
+                bool wasVisible;
+                try { wasVisible = _embed.Visible; }
+                catch { return; }
+                if (rect != _embedBounds)
+                {
+                    _embedBounds = rect;
+                    try { _embed.Bounds = rect; }
+                    catch { return; }
+                }
+                if (!wasVisible && !_embedMaskOn)
+                {
+                    try { _embed.Visible = true; _embed.BringToFront(); }
+                    catch { }
+                }
+                SyncEmbedMask();
+                BringShelfFront();
             }
 
             /// <summary>内嵌视图的状态推回面板：地址、标题、可否前进后退、加载中、缩放。</summary>
@@ -1234,10 +1977,13 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                     if (web == null || web.CoreWebView2 == null) return;
                     if (!_embedWanted) return;
                     CoreWebView2 core = _embed == null ? null : _embed.CoreWebView2;
+                    EmbedTab shown = ActiveTab();
                     Dictionary<string, object> payload = new Dictionary<string, object>();
                     payload["kind"] = "dsh-embed-state";
-                    payload["url"] = core == null ? "" : (core.Source ?? "");
-                    EmbedTab shown = ActiveTab();
+                    // 失败页的 Source 是 about:blank：地址栏仍要显示打不开的那个地址
+                    payload["url"] = shown != null && shown.Failed && !string.IsNullOrEmpty(shown.Url)
+                        ? shown.Url
+                        : (core == null ? "" : (core.Source ?? ""));
                     payload["title"] = shown == null ? (_embedTitle ?? "") : (shown.Title ?? "");
                     payload["canGoBack"] = core != null && core.CanGoBack;
                     payload["canGoForward"] = core != null && core.CanGoForward;
@@ -1288,6 +2034,8 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                     }
                     else if (action == "home")
                     {
+                        EmbedTab home = ActiveTab();
+                        if (home != null) { home.Url = EmbedHome; home.Failed = false; }
                         core.Navigate(EmbedHome);
                     }
                     else if (action == "zoomIn")
@@ -1297,6 +2045,10 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                     else if (action == "zoomOut")
                     {
                         SetEmbedZoom(_embed.ZoomFactor - EmbedZoomStep);
+                    }
+                    else if (action == "zoomReset")
+                    {
+                        SetEmbedZoom(1.0);
                     }
                 }
                 catch
@@ -1312,8 +2064,425 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                 double zoom = Math.Round(value, 2);
                 if (zoom < 0.25) zoom = 0.25;
                 if (zoom > 3.0) zoom = 3.0;
+                _embedZoomUser = zoom;
                 try { _embed.ZoomFactor = zoom; }
                 catch { }
+            }
+
+            /// <summary>右键菜单：默认那份是英文的，整份换掉（后退/前进/刷新/复制/粘贴/全选/链接/检查元素）。</summary>
+            private void EmbedContextMenu(object sender, CoreWebView2ContextMenuRequestedEventArgs e)
+            {
+                try
+                {
+                    CoreWebView2 core = null;
+                    try { core = _embed == null ? null : _embed.CoreWebView2; } catch { }
+                    if (core == null) return;
+                    CoreWebView2Environment env = core.Environment;
+                    CoreWebView2ContextMenuTarget target = e.ContextMenuTarget;
+                    bool editable = target != null && target.IsEditable;
+                    bool hasText = target != null && target.HasSelection;
+                    bool link = target != null && target.HasLinkUri;
+                    bool media = target != null && target.HasSourceUri;
+                    e.MenuItems.Clear();
+                    e.MenuItems.Add(EmbedMenuItem(env, "后退", core.CanGoBack, delegate { if (core.CanGoBack) core.GoBack(); }));
+                    e.MenuItems.Add(EmbedMenuItem(env, "前进", core.CanGoForward, delegate { if (core.CanGoForward) core.GoForward(); }));
+                    e.MenuItems.Add(EmbedMenuItem(env, "重新加载", true, delegate { core.Reload(); }));
+                    e.MenuItems.Add(EmbedSeparator(env));
+                    if (editable) e.MenuItems.Add(EmbedMenuItem(env, "粘贴", Clipboard.ContainsText(), delegate { EmbedPaste(); }));
+                    if (hasText) e.MenuItems.Add(EmbedMenuItem(env, "复制", true, delegate { EmbedCopy(target.SelectionText); }));
+                    e.MenuItems.Add(EmbedMenuItem(env, "全选", true, delegate { EmbedScript("document.execCommand('selectAll')"); }));
+                    if (link || media)
+                    {
+                        e.MenuItems.Add(EmbedSeparator(env));
+                        if (link) e.MenuItems.Add(EmbedMenuItem(env, "在新标签页打开链接", true, delegate { _embedWanted = true; NewEmbedTab(target.LinkUri, true); }));
+                        e.MenuItems.Add(EmbedMenuItem(env, link ? "复制链接地址" : "复制图片地址", true, delegate { EmbedCopy(link ? target.LinkUri : target.SourceUri); }));
+                    }
+                    e.MenuItems.Add(EmbedSeparator(env));
+                    e.MenuItems.Add(EmbedMenuItem(env, "检查元素", true, delegate { try { core.OpenDevToolsWindow(); } catch { } }));
+                }
+                catch { }
+            }
+
+            private static CoreWebView2ContextMenuItem EmbedSeparator(CoreWebView2Environment env)
+            {
+                return env.CreateContextMenuItem("", null, CoreWebView2ContextMenuItemKind.Separator);
+            }
+
+            private static CoreWebView2ContextMenuItem EmbedMenuItem(CoreWebView2Environment env, string label, bool enabled, Action act)
+            {
+                CoreWebView2ContextMenuItem item = env.CreateContextMenuItem(label, null, CoreWebView2ContextMenuItemKind.Command);
+                try { item.IsEnabled = enabled; } catch { }
+                if (act != null) item.CustomItemSelected += delegate(object s, object a) { try { act(); } catch { } };
+                return item;
+            }
+
+            private static void EmbedCopy(string text)
+            {
+                if (string.IsNullOrEmpty(text)) return;
+                try { Clipboard.SetText(text); } catch { }
+            }
+
+            private void EmbedScript(string js)
+            {
+                try { if (_embed != null && _embed.CoreWebView2 != null) _embed.CoreWebView2.ExecuteScriptAsync(js); } catch { }
+            }
+
+            /// <summary>粘贴：右键点在输入框里，把剪贴板文字塞回当前焦点元素。</summary>
+            private void EmbedPaste()
+            {
+                string text = "";
+                try { if (Clipboard.ContainsText()) text = Clipboard.GetText(); } catch { }
+                if (string.IsNullOrEmpty(text)) return;
+                EmbedScript("(function(t){var el=document.activeElement;if(!el)return;"
+                    + "if(el.isContentEditable){document.execCommand('insertText',false,t);return;}"
+                    + "if(el.tagName==='INPUT'||el.tagName==='TEXTAREA'){var s=el.selectionStart,e=el.selectionEnd,v=el.value;"
+                    + "el.value=v.slice(0,s)+t+v.slice(e);el.selectionStart=el.selectionEnd=s+t.length;"
+                    + "el.dispatchEvent(new Event('input',{bubbles:true}));}})(" + new JavaScriptSerializer().Serialize(text) + ")");
+            }
+
+            /// <summary>内嵌页面发来的消息：失败页的「重试」与页面里的快捷键。</summary>
+            private void EmbedPageMessage(EmbedTab tab, CoreWebView2WebMessageReceivedEventArgs e)
+            {
+                if (tab == null) return;
+                string json;
+                try { json = e.WebMessageAsJson; } catch { return; }
+                if (string.IsNullOrEmpty(json)) return;
+                Dictionary<string, object> msg;
+                try { msg = EmbedJson.Deserialize<Dictionary<string, object>>(json); }
+                catch { return; }
+                if (msg == null) return;
+                if (msg.ContainsKey("retry"))
+                {
+                    tab.Failed = false;
+                    try { if (tab.View.CoreWebView2 != null && !string.IsNullOrEmpty(tab.Url)) tab.View.CoreWebView2.Navigate(tab.Url); }
+                    catch { }
+                    return;
+                }
+                if (!msg.ContainsKey("kind") || Convert.ToString(msg["kind"]) != "dsh-embed-key") return;
+                EmbedKey(tab, msg.ContainsKey("key") ? Convert.ToString(msg["key"]) : "",
+                    msg.ContainsKey("shift") && AsBool(msg["shift"], false));
+            }
+
+            /// <summary>页面里的 Ctrl+...：WebView2 没有标签概念，这几个键只能自己接。</summary>
+            private void EmbedKey(EmbedTab tab, string key, bool shift)
+            {
+                if (string.IsNullOrEmpty(key)) return;
+                if (key == "t")
+                {
+                    _embedWanted = true;
+                    NewEmbedTab(EmbedHome, true);
+                    return;
+                }
+                if (key == "l")
+                {
+                    try { if (web != null) web.Focus(); } catch { }
+                    PostToPanel("{\"kind\":\"dsh-embed-focusurl\"}");
+                    return;
+                }
+                int slot = "12345678".IndexOf(key, StringComparison.Ordinal);
+                if (slot >= 0)
+                {
+                    if (slot < _embedTabs.Count) SelectEmbedTab(_embedTabs[slot].Id);
+                    return;
+                }
+                if (key == "w")
+                {
+                    CloseEmbedTab(_embedActiveId.Length > 0 ? _embedActiveId : tab.Id);
+                    return;
+                }
+                if (key == "tab")
+                {
+                    if (_embedTabs.Count < 2) return;
+                    int at = 0;
+                    for (int i = 0; i < _embedTabs.Count; i++) if (_embedTabs[i].Id == _embedActiveId) at = i;
+                    int step = shift ? -1 : 1;
+                    SelectEmbedTab(_embedTabs[(at + step + _embedTabs.Count) % _embedTabs.Count].Id);
+                }
+            }
+
+            /// <summary>失败页：深色卡片 + 重试（重试按钮 postMessage 回外壳）。</summary>
+            private static string EmbedErrorHtml(string reason, string url)
+            {
+                string safe = url == null ? "" : url.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;");
+                return EmbedErrorTemplate.Replace("__REASON__", reason == null ? "" : reason).Replace("__URL__", safe);
+            }
+
+            private static string EmbedFailText(CoreWebView2WebErrorStatus status)
+            {
+                switch (status)
+                {
+                    case CoreWebView2WebErrorStatus.HostNameNotResolved:
+                        return "找不到这个网址对应的服务器";
+                    case CoreWebView2WebErrorStatus.Timeout:
+                        return "服务器一直没有响应";
+                    case CoreWebView2WebErrorStatus.ServerUnreachable:
+                    case CoreWebView2WebErrorStatus.ConnectionAborted:
+                    case CoreWebView2WebErrorStatus.ConnectionReset:
+                    case CoreWebView2WebErrorStatus.CannotConnect:
+                    case CoreWebView2WebErrorStatus.Disconnected:
+                        return "连不上服务器";
+                    case CoreWebView2WebErrorStatus.CertificateCommonNameIsIncorrect:
+                    case CoreWebView2WebErrorStatus.CertificateExpired:
+                    case CoreWebView2WebErrorStatus.CertificateIsInvalid:
+                        return "证书有问题，连接不安全";
+                    default:
+                        return "页面没能加载出来";
+                }
+            }
+
+            /// <summary>下载：不用 WebView2 自带的下载 UI，走面板里那条下载条；文件落在安装盘下的 Downloads 目录。</summary>
+            private void EmbedDownloadStarting(object sender, CoreWebView2DownloadStartingEventArgs e)
+            {
+                try
+                {
+                    e.Handled = true;
+                    CoreWebView2DownloadOperation op = e.DownloadOperation;
+                    if (op == null) return;
+                    string dir = DownloadDir;
+                    try { Directory.CreateDirectory(dir); } catch { }
+                    string suggested = "";
+                    try { suggested = e.ResultFilePath ?? ""; } catch { }
+                    string name = NameFromPath(suggested);
+                    if (name.Length == 0)
+                    {
+                        try { name = NameFromPath(new Uri(op.Uri ?? "").LocalPath); }
+                        catch { }
+                    }
+                    if (name.Length == 0) name = "download";
+                    string path = UniquePath(dir, name);
+                    try { e.ResultFilePath = path; } catch { }
+                    EmbedDownload item = new EmbedDownload();
+                    item.Id = "d" + (++_downloadSerial).ToString();
+                    item.Name = name;
+                    item.Path = path;
+                    item.Op = op;
+                    _downloads.Add(item);
+                    while (_downloads.Count > 6) _downloads.RemoveAt(0);
+                    op.BytesReceivedChanged += delegate(object s2, object a2) { PumpDownload(item, false); };
+                    op.StateChanged += delegate(object s2, object a2)
+                    {
+                        try
+                        {
+                            if (op.State == CoreWebView2DownloadState.Completed)
+                            {
+                                item.State = "done";
+                                item.Path = op.ResultFilePath ?? item.Path;
+                            }
+                            else if (op.State == CoreWebView2DownloadState.Interrupted)
+                            {
+                                item.State = "fail";
+                                item.Reason = DownloadReasonText(op.InterruptReason);
+                            }
+                            else item.State = "run";
+                        }
+                        catch { }
+                        PumpDownload(item, true);
+                    };
+                    Program.LogResolve("embed download " + path);
+                    PumpDownload(item, true);
+                }
+                catch { }
+            }
+
+            /// <summary>字节数变化很密：最多 220ms 推一次；状态变化强制推。</summary>
+            private void PumpDownload(EmbedDownload item, bool force)
+            {
+                if (item == null) return;
+                try
+                {
+                    CoreWebView2DownloadOperation op = item.Op;
+                    if (op != null)
+                    {
+                        item.Received = op.BytesReceived;
+                        Nullable<ulong> total = op.TotalBytesToReceive;
+                        item.Total = total.HasValue ? (long)total.Value : 0;
+                    }
+                }
+                catch { }
+                DateTime now = DateTime.Now;
+                if (!force && (now - item.Pushed).TotalMilliseconds < 220) return;
+                item.Pushed = now;
+                PushDownloads();
+            }
+
+            private void PushDownloads()
+            {
+                try
+                {
+                    if (web == null || web.CoreWebView2 == null) return;
+                    List<Dictionary<string, object>> rows = new List<Dictionary<string, object>>();
+                    for (int i = 0; i < _downloads.Count; i++)
+                    {
+                        EmbedDownload item = _downloads[i];
+                        Dictionary<string, object> row = new Dictionary<string, object>();
+                        row["id"] = item.Id;
+                        row["name"] = item.Name;
+                        row["received"] = item.Received;
+                        row["total"] = item.Total;
+                        row["state"] = item.State;
+                        row["reason"] = item.Reason;
+                        rows.Add(row);
+                    }
+                    Dictionary<string, object> payload = new Dictionary<string, object>();
+                    payload["kind"] = "dsh-embed-download";
+                    payload["items"] = rows;
+                    web.CoreWebView2.PostWebMessageAsJson(new JavaScriptSerializer().Serialize(payload));
+                }
+                catch { }
+            }
+
+            /// <summary>下载条上的动作：取消 / 打开 / 在文件夹中显示 / 移除（id 为空表示全清）。</summary>
+            private void EmbedDownloadAction(Dictionary<string, object> msg)
+            {
+                string id = msg.ContainsKey("id") ? Convert.ToString(msg["id"]) : "";
+                string action = msg.ContainsKey("action") ? Convert.ToString(msg["action"]) : "";
+                EmbedDownload item = null;
+                for (int i = 0; i < _downloads.Count; i++)
+                {
+                    if (_downloads[i].Id == id) item = _downloads[i];
+                }
+                if (action == "clear")
+                {
+                    // 还在下的那条：移除等于不要了，顺手把下载也停掉，别留下一个看不见的下载
+                    if (item != null && item.State == "run")
+                    {
+                        try { if (item.Op != null) item.Op.Cancel(); }
+                        catch { }
+                    }
+                    if (item == null) _downloads.Clear();
+                    else _downloads.Remove(item);
+                    PushDownloads();
+                    return;
+                }
+                if (item == null) return;
+                try
+                {
+                    if (action == "cancel")
+                    {
+                        if (item.Op != null) item.Op.Cancel();
+                    }
+                    else if (action == "open")
+                    {
+                        if (!string.IsNullOrEmpty(item.Path)) Process.Start(item.Path);
+                    }
+                    else if (action == "reveal")
+                    {
+                        if (!string.IsNullOrEmpty(item.Path)) Process.Start("explorer.exe", "/select,\"" + item.Path + "\"");
+                    }
+                }
+                catch { }
+            }
+
+            private static string NameFromPath(string path)
+            {
+                if (string.IsNullOrEmpty(path)) return "";
+                try { return Path.GetFileName(path) ?? ""; }
+                catch { return ""; }
+            }
+
+            private static string UniquePath(string dir, string name)
+            {
+                string safe = name;
+                try
+                {
+                    char[] bad = Path.GetInvalidFileNameChars();
+                    for (int i = 0; i < bad.Length; i++) safe = safe.Replace(bad[i], '_');
+                }
+                catch { }
+                if (safe.Length == 0) safe = "download";
+                string path = Path.Combine(dir, safe);
+                try
+                {
+                    if (!File.Exists(path)) return path;
+                    string stem = Path.GetFileNameWithoutExtension(safe);
+                    string ext = Path.GetExtension(safe);
+                    for (int i = 1; i < 1000; i++)
+                    {
+                        string next = Path.Combine(dir, stem + " (" + i.ToString() + ")" + ext);
+                        if (!File.Exists(next)) return next;
+                    }
+                }
+                catch { }
+                return path;
+            }
+
+            private static string DownloadReasonText(CoreWebView2DownloadInterruptReason reason)
+            {
+                switch (reason)
+                {
+                    case CoreWebView2DownloadInterruptReason.UserCanceled:
+                        return "已取消";
+                    case CoreWebView2DownloadInterruptReason.UserPaused:
+                        return "已暂停";
+                    case CoreWebView2DownloadInterruptReason.NetworkDisconnected:
+                    case CoreWebView2DownloadInterruptReason.NetworkFailed:
+                        return "网络中断";
+                    case CoreWebView2DownloadInterruptReason.NetworkTimeout:
+                        return "下载超时";
+                    case CoreWebView2DownloadInterruptReason.NetworkServerDown:
+                        return "服务器无响应";
+                    case CoreWebView2DownloadInterruptReason.ServerUnauthorized:
+                    case CoreWebView2DownloadInterruptReason.ServerForbidden:
+                        return "服务器拒绝";
+                    case CoreWebView2DownloadInterruptReason.ServerCertificateProblem:
+                        return "证书有问题";
+                    case CoreWebView2DownloadInterruptReason.FileAccessDenied:
+                        return "文件写不进去";
+                    case CoreWebView2DownloadInterruptReason.FileNoSpace:
+                        return "磁盘空间不足";
+                    case CoreWebView2DownloadInterruptReason.FileBlockedByPolicy:
+                    case CoreWebView2DownloadInterruptReason.FileMalicious:
+                        return "被安全策略拦下";
+                    default:
+                        return "下载中断";
+                }
+            }
+
+            /// <summary>页面比视口宽（必应那种死版心的站）就自动缩到放得下；每页只做一次，用户手动调过就不再插手。</summary>
+            private async void AutoFitZoom(EmbedTab tab)
+            {
+                if (tab == null || tab.Fitted || _embedZoomUser > 0) return;
+                if (tab.Id != _embedActiveId) return;
+                // 刚完成导航时页面往往还没排完版，等一小会儿再量
+                try { await Task.Delay(260); }
+                catch { }
+                for (int round = 0; round < 2; round++)
+                {
+                    if (tab.Fitted || tab.Id != _embedActiveId) return;
+                    CoreWebView2 core = null;
+                    try { core = tab.View == null ? null : tab.View.CoreWebView2; }
+                    catch { }
+                    if (core == null) return;
+                    int want = 0;
+                    int view = 0;
+                    try
+                    {
+                        string raw = await core.ExecuteScriptAsync(
+                            "(function(){var d=document.documentElement,b=document.body;"
+                            + "var w=Math.max(d?d.scrollWidth:0,b?b.scrollWidth:0);"
+                            + "return w+'|'+(window.innerWidth||0);})()");
+                        string[] parts = UnquoteJson(raw).Split('|');
+                        if (parts.Length == 2)
+                        {
+                            int.TryParse(parts[0], out want);
+                            int.TryParse(parts[1], out view);
+                        }
+                    }
+                    catch { }
+                    if (want <= 0 || view <= 0) return;
+                    if (want <= view + 8) { tab.Fitted = true; return; }
+                    double zoom = 0;
+                    try { zoom = tab.View.ZoomFactor; }
+                    catch { }
+                    double next = Math.Round(zoom * view / want, 2);
+                    if (next < 0.4) next = 0.4;
+                    if (next >= zoom - 0.03) { tab.Fitted = true; return; }
+                    try { tab.View.ZoomFactor = next; }
+                    catch { }
+                    try { await Task.Delay(220); }
+                    catch { }
+                }
+                tab.Fitted = true;
             }
 
             private void HideEmbed()
@@ -1469,7 +2638,7 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                     {
                         CoreWebView2EnvironmentOptions options = new CoreWebView2EnvironmentOptions
                         {
-                            AdditionalBrowserArguments = "--remote-debugging-port=" + EmbedCdpPort + " --remote-allow-origins=*"
+                            AdditionalBrowserArguments = EmbedBrowserArgs
                         };
                         _embedEnv = await CoreWebView2Environment.CreateAsync(null, dir, options);
                     }
@@ -1486,9 +2655,37 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                 _embedBusy = false;
                 try { view.CoreWebView2.Settings.IsStatusBarEnabled = false; }
                 catch { }
-                try { view.ZoomFactor = EmbedZoom; }
+                try { view.DefaultBackgroundColor = EmbedBack; }
+                catch { }
+                // embed-profile 是独立环境，主视图设的深色跟随带不过来：不设这里，页面仍按浅色排
+                try { view.CoreWebView2.Profile.PreferredColorScheme = CoreWebView2PreferredColorScheme.Dark; }
+                catch { }
+                try { view.ZoomFactor = EmbedZoomFor(_embedBounds.IsEmpty ? 0 : _embedBounds.Width); }
+                catch { }
+                try { view.CoreWebView2.ContextMenuRequested += EmbedContextMenu; }
+                catch { }
+                try { view.CoreWebView2.DownloadStarting += EmbedDownloadStarting; }
+                catch { }
+                try
+                {
+                    Directory.CreateDirectory(DownloadDir);
+                    view.CoreWebView2.Profile.DefaultDownloadFolderPath = DownloadDir;
+                }
+                catch { }
+                try { view.ZoomFactorChanged += delegate(object s2, EventArgs a2) { PushEmbedState(); }; }
+                catch { }
+                try { Task keys = view.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync(EmbedKeyScript); }
                 catch { }
                 return view;
+            }
+
+            /// <summary>新标签的初始缩放：面板窄就缩一点，宽了回 100%；用户手动调过就用他那个值。</summary>
+            private double EmbedZoomFor(int panelWidth)
+            {
+                if (_embedZoomUser > 0) return _embedZoomUser;
+                if (panelWidth >= 560) return 1.0;
+                if (panelWidth >= 460) return 0.9;
+                return EmbedZoom;
             }
 
             /// <summary>开一个标签页（一块新的 WebView2 子控件）；activate=true 就切过去。</summary>
@@ -1511,9 +2708,15 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                     a2.Handled = true;
                     NewEmbedTab(a2.Uri, true);
                 };
+                // 页面 → 外壳：失败页的「重试」与页面里的快捷键（每块标签自己的 WebView2 收自己的）
+                view.CoreWebView2.WebMessageReceived += delegate(object s2, CoreWebView2WebMessageReceivedEventArgs a2)
+                {
+                    EmbedPageMessage(tab, a2);
+                };
                 view.CoreWebView2.NavigationStarting += delegate(object s3, CoreWebView2NavigationStartingEventArgs a3)
                 {
                     tab.Loading = true;
+                    tab.Fitted = false;
                     // 只有当前可见标签的导航才动画面：后台标签在加载不该把画面遮住
                     if (tab.Id == _embedActiveId)
                     {
@@ -1525,15 +2728,26 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                 view.CoreWebView2.NavigationCompleted += delegate(object s3, CoreWebView2NavigationCompletedEventArgs a3)
                 {
                     tab.Loading = false;
+                    // 失败时顶掉 Chromium 那张浅色错误页（被 Stop() 打断的不算失败）
+                    if (!a3.IsSuccess && a3.WebErrorStatus != CoreWebView2WebErrorStatus.OperationCanceled
+                        && !tab.Failed && tab.Url.Length > 0)
+                    {
+                        tab.Failed = true;
+                        try { tab.View.CoreWebView2.NavigateToString(EmbedErrorHtml(EmbedFailText(a3.WebErrorStatus), tab.Url)); }
+                        catch { }
+                    }
                     if (tab.Id == _embedActiveId)
                     {
                         _embedLoading = false;
                         ScheduleEmbedMaskClear();
+                        if (a3.IsSuccess) AutoFitZoom(tab);
                     }
                     PushEmbedState();
                 };
                 view.CoreWebView2.SourceChanged += delegate(object s3, CoreWebView2SourceChangedEventArgs a3)
                 {
+                    // 失败页是外壳塞进去的 about:blank，别让它把地址栏改掉
+                    if (tab.Failed) return;
                     try { tab.Url = tab.View.CoreWebView2.Source ?? tab.Url; }
                     catch { }
                     PushEmbedState();
@@ -1541,6 +2755,7 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                 view.CoreWebView2.HistoryChanged += delegate(object s3, object a3) { PushEmbedState(); };
                 view.CoreWebView2.DocumentTitleChanged += delegate(object s3, object a3)
                 {
+                    if (tab.Failed) return;
                     try { tab.Title = tab.View.CoreWebView2.DocumentTitle ?? ""; }
                     catch { }
                     PushEmbedState();
@@ -1551,6 +2766,7 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                 if (tab.Url.Length > 0)
                 {
                     Program.LogResolve("embed tab open " + tab.Url);
+                    tab.Failed = false;
                     try { view.CoreWebView2.Navigate(tab.Url); }
                     catch { }
                 }
@@ -1570,6 +2786,12 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                     if (_embedActiveId == id) _embedActiveId = _embedTabs.Count > 0 ? _embedTabs[Math.Max(0, i - 1)].Id : "";
                     SyncActiveTab();
                     PushEmbedState();
+                    // 关到零个标签：标签条留着也没画面。直接补一个首页，面板不会停在没画面的空态上
+                    if (_embedTabs.Count == 0)
+                    {
+                        _embedWanted = true;
+                        NewEmbedTab(EmbedHome, true);
+                    }
                     return;
                 }
             }
@@ -1583,6 +2805,7 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                 catch { }
                 BringShelfFront();
                 PushEmbedState();
+                AutoFitZoom(ActiveTab());
             }
 
             private EmbedTab ActiveTab()
@@ -1613,13 +2836,22 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                 _embedUrl = tab.Url ?? "";
                 _embedTitle = tab.Title ?? "";
                 _embedLoading = tab.Loading;
+                // 先让新的那块露面、抬到最前，再收掉旧的：一趟扫完中间会露一帧空白
+                bool show = _embedWanted && !_embedBounds.IsEmpty;
+                if (show)
+                {
+                    try { _embed.Bounds = _embedBounds; } catch { }
+                    try { _embed.Visible = true; _embed.BringToFront(); } catch { }
+                }
                 for (int i = 0; i < _embedTabs.Count; i++)
                 {
-                    try { _embedTabs[i].View.Visible = _embedWanted && _embedTabs[i].Id == _embedActiveId && !_embedBounds.IsEmpty; }
-                    catch { }
+                    if (_embedTabs[i].Id == _embedActiveId) continue;
+                    try { _embedTabs[i].View.Visible = false; } catch { }
                 }
-                try { if (_embed != null && _embed.Visible) _embed.Bounds = _embedBounds; }
-                catch { }
+                if (!show)
+                {
+                    try { _embed.Visible = false; } catch { }
+                }
                 // 关键：WinForms 里后 Add 的控件在 z 序最底，不抬上来就被主视图盖住（页面在跑却什么都看不到）
                 try { if (_embed != null && _embed.Visible) _embed.BringToFront(); }
                 catch { }
@@ -1659,6 +2891,7 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                     if (!string.IsNullOrEmpty(url) && url != tab.Url)
                     {
                         tab.Url = url;
+                        tab.Failed = false;
                         Program.LogResolve("embed open " + url);
                         try { tab.View.CoreWebView2.Navigate(url); }
                         catch { }
@@ -1764,7 +2997,7 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                     {
                         CoreWebView2EnvironmentOptions options = new CoreWebView2EnvironmentOptions
                         {
-                            AdditionalBrowserArguments = "--remote-debugging-port=" + EmbedCdpPort + " --remote-allow-origins=*"
+                            AdditionalBrowserArguments = EmbedBrowserArgs
                         };
                         _embedEnv = await CoreWebView2Environment.CreateAsync(null, dir, options);
                     }
@@ -2016,6 +3249,11 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                 if (_embedMaskSpin != null) _embedMaskSpin.Stop();
                 // 2026-09-11：取消关闭询问弹窗，点 X 一律静默驻留托盘（引擎 3080 与 WiFi 反代 3081 继续跑），
                 // 双击托盘图标随时唤回；系统注销/关机（CloseReason 非 UserClosing）仍直接放行。
+                // 2026-09-29：驻留方式从「外壳退出、交给托盘」改成「外壳活着、只把窗口藏起来」。
+                // 旧写法在这里 Close()，Application.Run 随即返回、外壳进程退出；而 3080 引擎是本进程用
+                // cmd 拉起来的子进程、stdout/stderr 接在本进程的匿名管道上 —— 读端一断，引擎下一次写日志
+                // 就 EPIPE 收摊，用户看到的就是「关掉窗口对话就断」。现在窗口隐藏、消息循环继续跑，引擎的
+                // pid 与 token 都不变；托盘「退出 DSH」才是唯一真正停 3080/3081 的入口。
                 if (_closeResolved || e.CloseReason != CloseReason.UserClosing)
                 {
                     base.OnFormClosing(e);
@@ -2024,7 +3262,81 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                 e.Cancel = true;
                 Program.EnsureTrayRunning();
                 _closeResolved = true;
-                Close();
+                // 只 Hide，不动 ShowInTaskbar：运行期改 ShowInTaskbar 会让 WinForms 重建窗口句柄，
+                // 主视图与右栏内嵌浏览器那两个 WebView2 子控件都要跟着重挂，得不偿失。
+                // 隐藏的顶层窗口本来就不占任务栏，Show() 回来它自然还在。
+                Hide();
+            }
+
+            /// <summary>被第二个实例或托盘「打开」用广播消息唤起时，把隐藏的主窗口重新显形。</summary>
+            private void ShowFromTray()
+            {
+                try
+                {
+                    if (!Visible) Show();
+                    if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
+                    Activate();
+                    BringToFront();
+                }
+                catch
+                {
+                }
+            }
+
+            protected override void WndProc(ref Message m)
+            {
+                // 没有 WS_CAPTION 的窗口，系统默认把「最大化」算成整块屏幕，任务栏会被盖住。
+                // 这里按当前显示器的工作区夹一次，最大化就停在任务栏上方。
+                if (m.Msg == Program.WM_GETMINMAXINFO)
+                {
+                    try
+                    {
+                        IntPtr mon = Program.MonitorFromWindow(Handle, Program.MONITOR_DEFAULTTONEAREST);
+                        Program.MonitorInfo mi = new Program.MonitorInfo();
+                        mi.cbSize = Marshal.SizeOf(typeof(Program.MonitorInfo));
+                        if (Program.GetMonitorInfo(mon, ref mi))
+                        {
+                            int w = mi.rcWork.right - mi.rcWork.left;
+                            int h = mi.rcWork.bottom - mi.rcWork.top;
+                            // 只夹到工作区还不够：无标题窗口的边框会留在屏幕内，看起来"四周多了一圈框"。
+                            // 用窗口自身的样式算一次边框，把客户区顶到工作区、边框推到屏幕外（和普通应用一致）
+                            Program.NRect want = new Program.NRect();
+                            want.left = 0; want.top = 0; want.right = w; want.bottom = h;
+                            int style = Program.GetWindowLong(Handle, Program.GWL_STYLE);
+                            int exStyle = Program.GetWindowLong(Handle, Program.GWL_EXSTYLE);
+                            bool adjusted = false;
+                            try { adjusted = Program.AdjustWindowRectExForDpi(ref want, style, false, exStyle, Program.GetDpiForWindow(Handle)); }
+                            catch { adjusted = false; }
+                            if (!adjusted)
+                            {
+                                want.left = 0; want.top = 0; want.right = w; want.bottom = h;
+                                try { Program.AdjustWindowRectEx(ref want, style, false, exStyle); }
+                                catch { }
+                            }
+                            Program.MinMaxInfo mmi = (Program.MinMaxInfo)Marshal.PtrToStructure(m.LParam, typeof(Program.MinMaxInfo));
+                            mmi.ptMaxPosition.x = mi.rcWork.left - mi.rcMonitor.left + want.left;
+                            mmi.ptMaxPosition.y = mi.rcWork.top - mi.rcMonitor.top + want.top;
+                            mmi.ptMaxSize.x = want.right - want.left;
+                            mmi.ptMaxSize.y = want.bottom - want.top;
+                            Marshal.StructureToPtr(mmi, m.LParam, false);
+                            m.Result = IntPtr.Zero;
+                            return;
+                        }
+                    }
+                    catch
+                    {
+                    }
+                }
+                if (m.Msg == Program.ShowWindowMessage)
+                {
+                    ShowFromTray();
+                    // 回声给发起方（wParam 带的是它的隐藏收信窗口句柄），它据此判断“实例还在”
+                    try { PostMessage(new IntPtr(HwndBroadcast), ShowAckMessage, m.WParam, IntPtr.Zero); }
+                    catch
+                    {
+                    }
+                }
+                base.WndProc(ref m);
             }
 
             private async void OnShown(object sender, EventArgs e)
@@ -2069,6 +3381,25 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                 try
                 {
                     web.CoreWebView2.Settings.IsStatusBarEnabled = false;
+                }
+                catch
+                {
+                }
+                try
+                {
+                    web.CoreWebView2.Profile.PreferredColorScheme = CoreWebView2PreferredColorScheme.Dark;
+                }
+                catch
+                {
+                }
+                // 深浅上报：注入给"之后创建"的文档，当前这份直接执行一次（否则主题永远不生效）
+                try
+                {
+                    await web.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync(ShellThemeScript);
+                    try { await web.CoreWebView2.ExecuteScriptAsync(ShellThemeScript); }
+                    catch
+                    {
+                    }
                 }
                 catch
                 {
